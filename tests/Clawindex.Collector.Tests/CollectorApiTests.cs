@@ -258,6 +258,38 @@ public sealed class CollectorApiTests
         Assert.Equal(1, await fixture.Repository.CountAsync());
     }
 
+    [Fact]
+    public async Task Repository_TracksUnprojectedEvents()
+    {
+        using var fixture = new CollectorFixture();
+        var acceptedEvent = new AcceptedEvent(
+            "evt_projection_test",
+            "0.1.0",
+            "agent.task.started",
+            DateTimeOffset.Parse("2026-05-11T22:15:00Z"),
+            DateTimeOffset.Parse("2026-05-11T22:15:01Z"),
+            "test-agent",
+            null,
+            null,
+            "trace_abc",
+            null,
+            "task_456",
+            "agent_soil_report",
+            null,
+            "{}",
+            """{"task_name":"Generate soil report"}""");
+
+        await fixture.Repository.InsertAsync(acceptedEvent);
+
+        var unprojected = await fixture.Repository.GetUnprojectedAsync(10);
+        Assert.Contains(unprojected, item => item.EventId == "evt_projection_test");
+
+        await fixture.Repository.MarkProjectedAsync("evt_projection_test");
+
+        unprojected = await fixture.Repository.GetUnprojectedAsync(10);
+        Assert.DoesNotContain(unprojected, item => item.EventId == "evt_projection_test");
+    }
+
     private static EventRequest ValidEvent(string eventType) => new(
         "0.1.0",
         eventType,
@@ -300,7 +332,8 @@ public sealed class CollectorFixture : IDisposable
                 {
                     config.AddInMemoryCollection(new Dictionary<string, string?>
                     {
-                        ["Clawindex:DatabasePath"] = DatabasePath
+                        ["Clawindex:DatabasePath"] = DatabasePath,
+                        ["Clawindex:Projection:Enabled"] = "false"
                     });
                 });
             });

@@ -1,0 +1,105 @@
+{
+  "events": [
+    {
+      "schema_version": "0.1.0",
+      "event_type": "agent.task.started",
+      "occurred_at": "2026-05-11T22:15:00Z",
+      "source": {
+        "system": "test-agent",
+        "component": "planner",
+        "version": "0.1.0"
+      },
+      "correlation": {
+        "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+        "task_id": "task_soil_report",
+        "agent_id": "agent_soil_report",
+        "session_id": "session_phase1"
+      },
+      "payload": {
+        "task_name": "Generate soil report"
+      }
+    },
+    {
+      "schema_version": "0.1.0",
+      "event_type": "tool.call.started",
+      "occurred_at": "2026-05-11T22:15:02Z",
+      "source": {
+        "system": "agent-runtime",
+        "component": "tool-router",
+        "version": "0.1.0"
+      },
+      "correlation": {
+        "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+        "span_id": "00f067aa0ba902b7",
+        "task_id": "task_soil_report",
+        "agent_id": "agent_soil_report",
+        "session_id": "session_phase1"
+      },
+      "payload": {
+        "tool_name": "calculate_recommendation",
+        "side_effect_type": "none"
+      }
+    },
+    {
+      "schema_version": "0.1.0",
+      "event_type": "policy.evaluated",
+      "occurred_at": "2026-05-11T22:15:03Z",
+      "source": {
+        "system": "bouncer-md",
+        "component": "resolver",
+        "version": "1.0.0"
+      },
+      "correlation": {
+        "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+        "task_id": "task_soil_report",
+        "agent_id": "agent_soil_report",
+        "session_id": "session_phase1"
+      },
+      "payload": {
+        "decision": "allow",
+        "policy_id": "soil-data-scope",
+        "reason": "Tool call is within approved scope"
+      }
+    },
+    {
+      "schema_version": "0.1.0",
+      "event_type": "tool.call.completed",
+      "occurred_at": "2026-05-11T22:15:06Z",
+      "source": {
+        "system": "agent-runtime",
+        "component": "tool-router",
+        "version": "0.1.0"
+      },
+      "correlation": {
+        "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+        "span_id": "00f067aa0ba902b7",
+        "task_id": "task_soil_report",
+        "agent_id": "agent_soil_report",
+        "session_id": "session_phase1"
+      },
+      "payload": {
+        "tool_name": "calculate_recommendation",
+        "side_effect_type": "none"
+      }
+    },
+    {
+      "schema_version": "0.1.0",
+      "event_type": "agent.task.completed",
+      "occurred_at": "2026-05-11T22:15:08Z",
+      "source": {
+        "system": "test-agent",
+        "component": "planner",
+        "version": "0.1.0"
+      },
+      "correlation": {
+        "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+        "task_id": "task_soil_report",
+        "agent_id": "agent_soil_report",
+        "session_id": "session_phase1"
+      },
+      "payload": {
+        "task_name": "Generate soil report"
+      }
+    }
+  ]
+}

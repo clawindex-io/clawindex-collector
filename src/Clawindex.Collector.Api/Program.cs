@@ -1,13 +1,27 @@
 using System.Text.Json;
 using Clawindex.Collector.Api;
 using Clawindex.Collector.Api.Persistence;
+using Clawindex.Collector.Api.Projection;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<EventEnvelopeValidator>();
 builder.Services.AddSingleton<EventRepository>();
+builder.Services.AddSingleton<OtelEventMapper>();
+builder.Services.Configure<OtelProjectionOptions>(builder.Configuration.GetSection("Clawindex:Projection"));
+builder.Services.AddHostedService<OtelProjectionWorker>();
 builder.Services.AddOpenApi();
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource => resource.AddService(ClawindexTelemetry.ServiceName, serviceVersion: "0.1.0"))
+    .WithTracing(tracing =>
+    {
+        tracing
+            .AddSource(ClawindexTelemetry.ActivitySourceName)
+            .AddOtlpExporter();
+    });
 
 var app = builder.Build();
 

@@ -36,11 +36,13 @@ public sealed class EventRepository(IConfiguration configuration)
               agent_id TEXT NULL,
               session_id TEXT NULL,
               raw_json TEXT NOT NULL,
-              payload_json TEXT NOT NULL
+              payload_json TEXT NOT NULL,
+              projected_at TEXT NULL
             );
             """;
 
         await command.ExecuteNonQueryAsync();
+        await EnsureProjectedAtColumnAsync(connection);
     }
 
     public async Task InsertAsync(AcceptedEvent acceptedEvent)
@@ -91,22 +93,54 @@ public sealed class EventRepository(IConfiguration configuration)
             return null;
         }
 
-        return new AcceptedEvent(
-            reader.GetString(0),
-            reader.GetString(1),
-            reader.GetString(2),
-            DateTimeOffset.Parse(reader.GetString(3)),
-            DateTimeOffset.Parse(reader.GetString(4)),
-            reader.GetString(5),
-            ReadNullableString(reader, 6),
-            ReadNullableString(reader, 7),
-            ReadNullableString(reader, 8),
-            ReadNullableString(reader, 9),
-            ReadNullableString(reader, 10),
-            ReadNullableString(reader, 11),
-            ReadNullableString(reader, 12),
-            reader.GetString(13),
-            reader.GetString(14));
+        return ReadAcceptedEvent(reader);
+    }
+
+    public async Task<IReadOnlyList<AcceptedEvent>> GetUnprojectedAsync(int limit, CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT event_id, schema_version, event_type, occurred_at, received_at,
+                   source_system, source_component, source_version,
+                   trace_id, span_id, task_id, agent_id, session_id,
+                   raw_json, payload_json
+            FROM events
+            WHERE projected_at IS NULL
+            ORDER BY received_at, occurred_at
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$limit", limit);
+
+        var events = new List<AcceptedEvent>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            events.Add(ReadAcceptedEvent(reader));
+        }
+
+        return events;
+    }
+
+    public async Task MarkProjectedAsync(string eventId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE events
+            SET projected_at = $projected_at
+            WHERE event_id = $event_id;
+            """;
+        command.Parameters.AddWithValue("$event_id", eventId);
+        command.Parameters.AddWithValue("$projected_at", DateTimeOffset.UtcNow.ToString("O"));
+
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task<int> CountAsync()
@@ -160,8 +194,56 @@ public sealed class EventRepository(IConfiguration configuration)
 
     private static object ToDbValue(string? value) => string.IsNullOrWhiteSpace(value) ? DBNull.Value : value;
 
+    private static AcceptedEvent ReadAcceptedEvent(SqliteDataReader reader)
+    {
+        return new AcceptedEvent(
+            reader.GetString(0),
+            reader.GetString(1),
+            reader.GetString(2),
+            DateTimeOffset.Parse(reader.GetString(3)),
+            DateTimeOffset.Parse(reader.GetString(4)),
+            reader.GetString(5),
+            ReadNullableString(reader, 6),
+            ReadNullableString(reader, 7),
+            ReadNullableString(reader, 8),
+            ReadNullableString(reader, 9),
+            ReadNullableString(reader, 10),
+            ReadNullableString(reader, 11),
+            ReadNullableString(reader, 12),
+            reader.GetString(13),
+            reader.GetString(14));
+    }
+
     private static string? ReadNullableString(SqliteDataReader reader, int ordinal) =>
         reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+
+    private static async Task EnsureProjectedAtColumnAsync(SqliteConnection connection)
+    {
+        await using var columnsCommand = connection.CreateCommand();
+        columnsCommand.CommandText = "PRAGMA table_info(events);";
+
+        var hasColumn = false;
+        await using (var reader = await columnsCommand.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                if (string.Equals(reader.GetString(1), "projected_at", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasColumn = true;
+                    break;
+                }
+            }
+        }
+
+        if (hasColumn)
+        {
+            return;
+        }
+
+        await using var alterCommand = connection.CreateCommand();
+        alterCommand.CommandText = "ALTER TABLE events ADD COLUMN projected_at TEXT NULL;";
+        await alterCommand.ExecuteNonQueryAsync();
+    }
 
     private static string BuildConnectionString(IConfiguration configuration)
     {

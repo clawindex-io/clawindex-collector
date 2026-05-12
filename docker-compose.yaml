@@ -1,11 +1,24 @@
 services:
+  aspire-dashboard:
+    image: mcr.microsoft.com/dotnet/aspire-dashboard:latest
+    ports:
+      - "18888:18888"
+      - "4317:18889"
+      - "4318:18890"
+    environment:
+      ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS: "true"
+
   clawindex-collector:
     build: .
+    depends_on:
+      - aspire-dashboard
     ports:
       - "8080:8080"
     environment:
       ASPNETCORE_URLS: http://+:8080
       CLAWINDEX_DB_PATH: /data/clawindex-collector.db
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://aspire-dashboard:18889
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
     volumes:
       - clawindex-data:/data
 
