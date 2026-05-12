@@ -1,0 +1,13 @@
+services:
+  clawindex-collector:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      CLAWINDEX_DB_PATH: /data/clawindex-collector.db
+    volumes:
+      - clawindex-data:/data
+
+volumes:
+  clawindex-data:

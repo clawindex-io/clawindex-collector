@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Clawindex.Collector.Api/Clawindex.Collector.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Clawindex.Collector.Tests/Clawindex.Collector.Tests.csproj" />
+  </Folder>
+</Solution>
