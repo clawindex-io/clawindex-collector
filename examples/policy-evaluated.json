@@ -1,0 +1,20 @@
+{
+  "schema_version": "0.1.0",
+  "event_type": "policy.evaluated",
+  "occurred_at": "2026-05-11T22:15:00Z",
+  "source": {
+    "system": "bouncer-md",
+    "component": "resolver",
+    "version": "1.0.0"
+  },
+  "correlation": {
+    "trace_id": "trace_abc",
+    "task_id": "task_456",
+    "agent_id": "agent_soil_report"
+  },
+  "payload": {
+    "decision": "deny",
+    "policy_id": "soil-data-scope",
+    "reason": "Tool call attempted outside approved scope"
+  }
+}

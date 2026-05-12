@@ -1,0 +1,15 @@
+{
+  "events": [
+    {
+      "schema_version": "0.1.0",
+      "event_type": "agent.task.started",
+      "occurred_at": "2026-05-11T22:15:00Z",
+      "source": {
+        "system": "test-agent"
+      },
+      "payload": {
+        "task_name": "Generate soil report"
+      }
+    }
+  ]
+}

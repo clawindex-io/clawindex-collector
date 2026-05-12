@@ -1,0 +1,20 @@
+{
+  "schema_version": "0.1.0",
+  "event_type": "tool.call.started",
+  "occurred_at": "2026-05-11T22:16:00Z",
+  "source": {
+    "system": "agent-runtime",
+    "component": "tool-router",
+    "version": "0.1.0"
+  },
+  "correlation": {
+    "trace_id": "trace_abc",
+    "span_id": "span_tool_001",
+    "task_id": "task_456",
+    "agent_id": "agent_soil_report"
+  },
+  "payload": {
+    "tool_name": "calculate_recommendation",
+    "side_effect_type": "none"
+  }
+}
