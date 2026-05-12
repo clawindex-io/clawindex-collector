@@ -14,6 +14,7 @@ COPY --from=build /app/publish .
 
 ENV ASPNETCORE_URLS=http://+:8080
 ENV CLAWINDEX_DB_PATH=/data/clawindex-collector.db
+ENV OTEL_EXPORTER_OTLP_PROTOCOL=grpc
 
 VOLUME ["/data"]
 EXPOSE 8080

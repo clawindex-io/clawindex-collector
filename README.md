@@ -1,27 +1,77 @@
-# Clawindex Collector v0.1
+# Clawindex Collector
 
-Clawindex Collector is a narrow intake service for governed agent telemetry. It validates event envelopes, generates missing event IDs, stamps `received_at`, preserves raw inbound JSON, and persists accepted events to SQLite.
+Clawindex Collector is the intake and projection layer for governed agent telemetry. It accepts validated Clawindex event envelopes, stores them in SQLite, and projects accepted events into OpenTelemetry-compatible traces for local visualization in Aspire Dashboard.
+
+Phase 1 is a spike: it proves Clawindex IR can flow into standard OTel tooling. It does not add Clawindex UI, replay, analytics, risk scoring, multi-tenancy, SIEM integrations, or production orchestration.
+
+## Architecture
+
+```text
+Agent / bouncer-md / adapter
+        |
+        v
+Clawindex Collector intake API
+        |
+        v
+SQLite validated event store
+        |
+        v
+OTel projection worker
+        |
+        v
+OTLP export
+        |
+        v
+Aspire Dashboard
+```
+
+The projection worker polls unprojected rows from SQLite, maps task/tool events to spans, maps policy and human-review events to span events, marks rows as projected, and exports through OTLP.
 
 ## Prerequisites
 
 - .NET SDK 10.0 or newer
-- Optional: Docker
+- Docker, for Aspire Dashboard and Docker Compose flows
+- `sqlite3`, for local database inspection
 
-## Run Locally
+## Running Locally
+
+Start Aspire Dashboard in a separate terminal:
 
 ```bash
+docker run --rm -it \
+  -p 18888:18888 \
+  -p 4317:18889 \
+  -p 4318:18890 \
+  -e ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true \
+  --name aspire-dashboard \
+  mcr.microsoft.com/dotnet/aspire-dashboard:latest
+```
+
+Run the collector and point OTLP at Aspire:
+
+```bash
+CLAWINDEX_DB_PATH=./data/clawindex-collector.db \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
 dotnet run --project src/Clawindex.Collector.Api --urls http://localhost:5000
 ```
 
-By default the SQLite database is created under the app output directory at `data/clawindex-collector.db`.
+The service initializes the SQLite schema automatically. The default local database path in these examples is `./data/clawindex-collector.db`.
 
-Override the database path:
+## Running With Docker
 
 ```bash
-CLAWINDEX_DB_PATH=./data/clawindex-collector.db dotnet run --project src/Clawindex.Collector.Api --urls http://localhost:5000
+docker compose up --build
 ```
 
-The service initializes the SQLite schema automatically on startup.
+Docker Compose starts:
+
+- Collector API: `http://localhost:8080`
+- Aspire Dashboard: `http://localhost:18888`
+- Aspire OTLP/gRPC: `http://localhost:4317`
+- Aspire OTLP/HTTP: `http://localhost:4318`
+
+The collector stores SQLite data in the `clawindex-data` Docker volume and exports OTLP to the Aspire Dashboard container.
 
 ## Endpoints
 
@@ -31,7 +81,7 @@ The service initializes the SQLite schema automatically on startup.
 - `POST /v1/events/batch`
 - `GET /openapi/v1.json`
 
-## Curl Examples
+## Posting Sample Events
 
 Health:
 
@@ -45,7 +95,7 @@ Schema:
 curl http://localhost:5000/v1/schema
 ```
 
-Single event:
+Single policy event:
 
 ```bash
 curl -X POST http://localhost:5000/v1/events \
@@ -53,7 +103,7 @@ curl -X POST http://localhost:5000/v1/events \
   --data-binary @examples/policy-evaluated.json
 ```
 
-Tool-call event:
+Single tool event:
 
 ```bash
 curl -X POST http://localhost:5000/v1/events \
@@ -61,24 +111,7 @@ curl -X POST http://localhost:5000/v1/events \
   --data-binary @examples/tool-call.json
 ```
 
-Invalid event:
-
-```bash
-curl -X POST http://localhost:5000/v1/events \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "schema_version": "0.1.0",
-    "occurred_at": "2026-05-11T22:15:00Z",
-    "source": {
-      "system": "bouncer-md"
-    },
-    "payload": {
-      "decision": "deny"
-    }
-  }'
-```
-
-Batch event:
+Batch intake event:
 
 ```bash
 curl -X POST http://localhost:5000/v1/events/batch \
@@ -86,38 +119,41 @@ curl -X POST http://localhost:5000/v1/events/batch \
   --data-binary @examples/batch-events.json
 ```
 
-Partial batch failure:
+Complete correlated trace for Aspire:
 
 ```bash
 curl -X POST http://localhost:5000/v1/events/batch \
   -H 'Content-Type: application/json' \
-  -d '{
-    "events": [
-      {
-        "schema_version": "0.1.0",
-        "event_type": "agent.task.started",
-        "occurred_at": "2026-05-11T22:15:00Z",
-        "source": { "system": "test-agent" },
-        "payload": { "task_name": "Generate soil report" }
-      },
-      {
-        "schema_version": "0.1.0",
-        "occurred_at": "2026-05-11T22:15:00Z",
-        "source": { "system": "test-agent" },
-        "payload": { "task_name": "Missing event type" }
-      }
-    ]
-  }'
+  --data-binary @examples/phase1-correlated-trace.json
 ```
 
-## Inspect SQLite
+For Docker Compose, replace `localhost:5000` with `localhost:8080`.
+
+## Viewing Traces In Aspire
+
+1. Open `http://localhost:18888`.
+2. Go to the Traces page.
+3. Post `examples/phase1-correlated-trace.json`.
+4. Look for service `clawindex-collector`.
+5. Open the trace with ID `4bf92f3577b34da6a3ce929d0e0e4736`.
+
+Expected shape:
+
+- `agent.task Generate soil report` is the root span.
+- `tool.call calculate_recommendation` appears beneath the task span.
+- `policy.evaluated` appears as a span event on the active tool span.
+- Clawindex correlation appears as attributes such as `clawindex.trace_id`, `clawindex.task_id`, and `clawindex.agent_id`.
+
+Clawindex IDs that are already valid W3C trace/span IDs are used directly. Non-W3C IDs, such as `trace_abc`, are preserved as `clawindex.trace_id` and mapped to stable valid OTel IDs for export.
+
+## Inspecting SQLite
 
 Use the same path passed to `CLAWINDEX_DB_PATH`.
 
 ```bash
 sqlite3 ./data/clawindex-collector.db '.schema events'
 sqlite3 ./data/clawindex-collector.db 'select count(*) from events;'
-sqlite3 ./data/clawindex-collector.db 'select event_id, event_type, source_system, trace_id, task_id, received_at from events order by received_at;'
+sqlite3 ./data/clawindex-collector.db 'select event_id, event_type, source_system, trace_id, task_id, received_at, projected_at from events order by received_at;'
 ```
 
 Check raw JSON preservation:
@@ -126,13 +162,50 @@ Check raw JSON preservation:
 sqlite3 ./data/clawindex-collector.db 'select event_type, length(raw_json), length(payload_json) from events;'
 ```
 
-## Docker
+Inspect the Docker Compose SQLite volume:
 
 ```bash
-docker compose up --build
+docker run --rm -v pulse-collector_clawindex-data:/data alpine:latest \
+  sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /data/clawindex-collector.db 'select event_type, trace_id, task_id, projected_at from events order by received_at;'"
 ```
 
-The service listens on `http://localhost:8080` in Docker and stores SQLite data in the `clawindex-data` volume.
+## OTLP Configuration
+
+The collector uses the standard OpenTelemetry environment variables:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+```
+
+For Docker Compose, the collector uses:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://aspire-dashboard:18889
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+```
+
+Projection worker settings live under `Clawindex:Projection`:
+
+```json
+{
+  "Clawindex": {
+    "Projection": {
+      "Enabled": true,
+      "PollIntervalMilliseconds": 1000,
+      "BatchSize": 100
+    }
+  }
+}
+```
+
+## Troubleshooting
+
+- No traces in Aspire: make sure Aspire is running before posting events and `OTEL_EXPORTER_OTLP_ENDPOINT` points to `http://localhost:4317` locally.
+- Started-only events do not appear as completed spans: post `examples/phase1-correlated-trace.json`, which includes completion events.
+- Docker traces missing: run `docker compose logs clawindex-collector` and confirm the collector is using `http://aspire-dashboard:18889`.
+- SQLite has rows but no projection: inspect `projected_at`; null values indicate the worker has not marked rows projected yet.
+- Aspire login prompt: the README and Compose commands set `ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true` for local development.
 
 ## Test
 
