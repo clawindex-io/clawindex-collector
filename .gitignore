@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# .NET
+bin/
+obj/
+
+# Local data
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# IDE/editor
+.vs/
+.vscode/
