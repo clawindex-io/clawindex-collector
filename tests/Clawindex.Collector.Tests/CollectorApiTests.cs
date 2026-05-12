@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -126,7 +127,69 @@ public sealed class CollectorApiTests
     }
 
     [Fact]
-    public async Task Events_RejectsNonObjectPayload()
+    public async Task Events_RejectsMalformedJson()
+    {
+        using var fixture = new CollectorFixture();
+        var client = fixture.CreateClient();
+        using var content = new StringContent("{", Encoding.UTF8, "application/json");
+
+        using var response = await client.PostAsync("/v1/events", content);
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("rejected", body.RootElement.GetProperty("status").GetString());
+        Assert.Equal("validation_failed", body.RootElement.GetProperty("error").GetProperty("code").GetString());
+        Assert.Equal("Request body must be valid JSON", body.RootElement.GetProperty("error").GetProperty("message").GetString());
+        Assert.Equal(0, await fixture.Repository.CountAsync());
+    }
+
+    [Fact]
+    public async Task Events_RejectsMissingSourceSystem()
+    {
+        using var fixture = new CollectorFixture();
+        var client = fixture.CreateClient();
+        var request = new
+        {
+            schema_version = "0.1.0",
+            event_type = "policy.evaluated",
+            occurred_at = "2026-05-11T22:15:00Z",
+            source = new { component = "resolver" },
+            payload = new { decision = "deny" }
+        };
+
+        using var response = await client.PostAsJsonAsync("/v1/events", request);
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("validation_failed", body.RootElement.GetProperty("error").GetProperty("code").GetString());
+        Assert.Equal("Missing required field: source.system", body.RootElement.GetProperty("error").GetProperty("message").GetString());
+        Assert.Equal(0, await fixture.Repository.CountAsync());
+    }
+
+    [Fact]
+    public async Task Events_RejectsMissingPayload()
+    {
+        using var fixture = new CollectorFixture();
+        var client = fixture.CreateClient();
+        var request = new
+        {
+            schema_version = "0.1.0",
+            event_type = "policy.evaluated",
+            occurred_at = "2026-05-11T22:15:00Z",
+            source = new { system = "bouncer-md" }
+        };
+
+        using var response = await client.PostAsJsonAsync("/v1/events", request);
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("validation_failed", body.RootElement.GetProperty("error").GetProperty("code").GetString());
+        Assert.Equal("Missing required field: payload", body.RootElement.GetProperty("error").GetProperty("message").GetString());
+        Assert.Equal(0, await fixture.Repository.CountAsync());
+    }
+
+    [Fact]
+    public async Task Events_RejectsMalformedPayload()
     {
         using var fixture = new CollectorFixture();
         var client = fixture.CreateClient();
@@ -145,6 +208,7 @@ public sealed class CollectorApiTests
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.Equal("Missing required field: payload", body.RootElement.GetProperty("error").GetProperty("message").GetString());
+        Assert.Equal(0, await fixture.Repository.CountAsync());
     }
 
     [Fact]
@@ -187,8 +251,10 @@ public sealed class CollectorApiTests
         Assert.Equal(1, body.RootElement.GetProperty("accepted_count").GetInt32());
         Assert.Equal(1, body.RootElement.GetProperty("rejected_count").GetInt32());
         Assert.Equal("accepted", body.RootElement.GetProperty("results")[0].GetProperty("status").GetString());
+        Assert.StartsWith("evt_", body.RootElement.GetProperty("results")[0].GetProperty("event_id").GetString());
         Assert.Equal("rejected", body.RootElement.GetProperty("results")[1].GetProperty("status").GetString());
         Assert.Equal("validation_failed", body.RootElement.GetProperty("results")[1].GetProperty("error").GetProperty("code").GetString());
+        Assert.Equal("Missing required field: event_type", body.RootElement.GetProperty("results")[1].GetProperty("error").GetProperty("message").GetString());
         Assert.Equal(1, await fixture.Repository.CountAsync());
     }
 
