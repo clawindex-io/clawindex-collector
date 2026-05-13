@@ -25,7 +25,9 @@ OTLP export
 Aspire Dashboard
 ```
 
-The projection worker polls unprojected rows from SQLite, maps task/tool events to spans, maps policy and human-review events to span events, marks rows as projected, and exports through OTLP.
+The projection worker polls unprojected rows from SQLite, maps task/tool events to durable span lifecycle state, maps policy and human-review events to span events, marks rows as projected, and exports completed traces through OTLP.
+
+Durable span state lives in SQLite rather than process memory. On startup the collector initializes the lifecycle tables, resets any `in_progress` projection rows back to `pending`, logs the number of open traces and spans recovered from SQLite, and then continues projecting new events against that persisted state. Open or incomplete spans remain queryable after a restart.
 
 ## Prerequisites
 
@@ -168,14 +170,60 @@ Golden topology checks:
 
 Clawindex IDs that are already valid W3C trace/span IDs are used directly. Non-W3C IDs, such as `trace_abc`, are preserved as `clawindex.trace_id` and mapped to stable valid OTel IDs for export.
 
+## Durable Span State
+
+Phase 1.2 persists trace correlation and span lifecycle state in these SQLite tables:
+
+- `events`: validated event envelopes plus projection status (`pending`, `in_progress`, `failed`, `projected`).
+- `trace_state`: one durable row per trace with `trace_id`, `root_span_id`, task/agent correlation, lifecycle status, and start/end timestamps.
+- `span_state`: durable root and child span rows with parent linkage, source start/end event IDs, lifecycle status, timestamps, and projected attributes JSON.
+- `event_span_map`: idempotent event-to-span relationships for source start/end events, span events, duplicate lifecycle events, and instant events.
+
+Lifecycle rules:
+
+- `agent.task.started` opens or updates `trace_state` and creates the root `agent.task` span.
+- `agent.task.completed` closes the root span and marks the trace `completed`.
+- `agent.task.failed` closes the root span and marks the trace and root span `error`.
+- `tool.call.started` creates an open child span under the recovered root/task span when possible.
+- `tool.call.completed` closes the matching child span as `completed`.
+- `tool.call.failed` closes the matching child span as `error`.
+- `policy.*` and `human.review.*` attach to the best open span and preserve the relationship in `event_span_map`.
+- Orphan lifecycle or policy events create deterministic placeholder state, log a structured warning, and keep the event mapped instead of dropping it.
+
+Duplicate event projection is guarded by `event_span_map.event_id`. Duplicate completion events map as duplicate lifecycle events and do not reopen or corrupt already closed spans.
+
 ## Inspecting SQLite
 
 Use the same path passed to `CLAWINDEX_DB_PATH`.
 
 ```bash
 sqlite3 ./data/clawindex-collector.db '.schema events'
+sqlite3 ./data/clawindex-collector.db '.schema trace_state'
+sqlite3 ./data/clawindex-collector.db '.schema span_state'
+sqlite3 ./data/clawindex-collector.db '.schema event_span_map'
 sqlite3 ./data/clawindex-collector.db 'select count(*) from events;'
 sqlite3 ./data/clawindex-collector.db 'select event_id, event_type, source_system, trace_id, task_id, received_at, projection_status, projection_attempts, projected_at, projection_errors from events order by received_at;'
+```
+
+Inspect durable traces:
+
+```bash
+sqlite3 ./data/clawindex-collector.db \
+  'select trace_id, root_span_id, task_id, agent_id, status, started_at, ended_at, updated_at from trace_state order by updated_at;'
+```
+
+Inspect durable spans:
+
+```bash
+sqlite3 ./data/clawindex-collector.db \
+  'select span_id, trace_id, parent_span_id, span_kind, status, source_start_event_id, source_end_event_id, started_at, ended_at from span_state order by started_at;'
+```
+
+Inspect event-to-span relationships:
+
+```bash
+sqlite3 ./data/clawindex-collector.db \
+  'select event_id, trace_id, span_id, relationship_type, created_at from event_span_map order by created_at;'
 ```
 
 Check raw JSON preservation:
@@ -190,6 +238,17 @@ Inspect the Docker Compose SQLite volume:
 docker run --rm -v pulse-collector_clawindex-data:/data alpine:latest \
   sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /data/clawindex-collector.db 'select event_type, trace_id, task_id, projection_status, projection_attempts, projected_at from events order by received_at;'"
 ```
+
+Simulate restart recovery:
+
+```bash
+CLAWINDEX_DB_PATH=./data/clawindex-collector.db \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
+dotnet run --project src/Clawindex.Collector.Api --urls http://localhost:5000
+```
+
+Post only a task start event, stop the collector, then start it again with the same `CLAWINDEX_DB_PATH`. The startup log reports recovered open traces/spans. Post the matching tool and task completion events after restart, then inspect `trace_state`, `span_state`, and Aspire to confirm the new events attached to the recovered state.
 
 Reset local SQLite:
 
@@ -241,9 +300,16 @@ Projection worker settings live under `Clawindex:Projection`:
 - Docker traces missing: run `docker compose logs clawindex-collector` and confirm the collector is using `http://aspire-dashboard:18889`.
 - SQLite has rows but no projection: inspect `projection_status`, `projection_attempts`, `projected_at`, and `projection_errors`.
 - Missing parent spans: check collector logs for structured warnings containing `EventId`, `TraceId`, `TaskId`, and `SpanId`.
-- Out-of-order lifecycle events: projection retries failed rows up to `Clawindex:Projection:MaxAttempts`; rows that still cannot be correlated stay `failed` with `projection_errors`.
+- Out-of-order lifecycle events: the collector creates placeholder durable state when needed, then maps the event so the evidence remains inspectable.
 - Duplicate completion events: duplicates are marked projected but do not emit duplicate task/tool spans.
 - Aspire login prompt: the README and Compose commands set `ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true` for local development.
+
+Known limitations:
+
+- Completed traces are exported when the root task span closes; there is no replay engine for manually re-exporting historical traces.
+- Placeholder spans are deterministic and inspectable, but Phase 1.2 does not attempt advanced repair beyond later events attaching to the same durable IDs.
+- SQLite access is suitable for the local spike. Production queueing, distributed locking, and multi-tenant authorization are intentionally out of scope.
+- Analytics, risk scoring, and Clawindex UI views are not implemented in this phase.
 
 ## Test
 

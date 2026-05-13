@@ -30,7 +30,7 @@ public sealed class OtelProjectionWorker(
                 foreach (var acceptedEvent in events)
                 {
                     await repository.MarkProjectionAttemptAsync(acceptedEvent.EventId, stoppingToken);
-                    var result = mapper.Project(acceptedEvent);
+                    var result = await mapper.ProjectAsync(acceptedEvent, stoppingToken);
                     if (result.Succeeded)
                     {
                         await repository.MarkProjectedAsync(acceptedEvent.EventId, stoppingToken);
