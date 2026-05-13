@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Clawindex.Collector.Api.Persistence;
 using Clawindex.Collector.Api.Projection;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Clawindex.Collector.Tests;
@@ -23,11 +24,11 @@ public sealed class OtelEventMapperTests : IDisposable
     }
 
     [Fact]
-    public void Project_CreatesToolSpanUnderTaskSpan_WithPolicySpanEvent()
+    public async Task Project_CreatesToolSpanUnderTaskSpan_WithPolicySpanEvent()
     {
-        var mapper = CreateMapper();
+        using var context = await TestMapperContext.CreateAsync();
 
-        ProjectAll(mapper, HappyPath());
+        await ProjectAllAsync(context, HappyPath());
 
         var toolSpan = Assert.Single(_stoppedActivities, activity => activity.DisplayName.StartsWith("tool.call", StringComparison.Ordinal));
         var taskSpan = Assert.Single(_stoppedActivities, activity => activity.DisplayName.StartsWith("agent.task", StringComparison.Ordinal));
@@ -40,13 +41,16 @@ public sealed class OtelEventMapperTests : IDisposable
     }
 
     [Fact]
-    public void Project_PreservesValidIncomingTraceIdAsActivityTraceId()
+    public async Task Project_PreservesValidIncomingTraceIdAsActivityTraceId()
     {
-        var mapper = CreateMapper();
+        using var context = await TestMapperContext.CreateAsync();
         const string traceId = "4bf92f3577b34da6a3ce929d0e0e4736";
 
-        mapper.Project(Event("evt_task_start", "agent.task.started", traceId: traceId, taskId: "task_456"));
-        mapper.Project(Event("evt_task_done", "agent.task.completed", traceId: traceId, taskId: "task_456"));
+        await ProjectAllAsync(context,
+        [
+            Event("evt_task_start", "agent.task.started", traceId: traceId, taskId: "task_456"),
+            Event("evt_task_done", "agent.task.completed", traceId: traceId, taskId: "task_456")
+        ]);
 
         var taskSpan = Assert.Single(_stoppedActivities);
         Assert.Equal(traceId, taskSpan.TraceId.ToString());
@@ -54,11 +58,11 @@ public sealed class OtelEventMapperTests : IDisposable
     }
 
     [Fact]
-    public void Project_FailurePath_MarksToolAndTaskSpansAsError()
+    public async Task Project_FailurePath_MarksToolAndTaskSpansAsError()
     {
-        var mapper = CreateMapper();
+        using var context = await TestMapperContext.CreateAsync();
 
-        ProjectAll(mapper, FailurePath());
+        await ProjectAllAsync(context, FailurePath());
 
         var toolSpan = Assert.Single(_stoppedActivities, activity => activity.DisplayName.StartsWith("tool.call", StringComparison.Ordinal));
         var taskSpan = Assert.Single(_stoppedActivities, activity => activity.DisplayName.StartsWith("agent.task", StringComparison.Ordinal));
@@ -70,47 +74,213 @@ public sealed class OtelEventMapperTests : IDisposable
     }
 
     [Fact]
-    public void Project_EscalationPath_AttachesPolicyAndHumanReviewEventsToTaskSpan()
+    public async Task RootSpan_Persists()
     {
-        var mapper = CreateMapper();
+        using var context = await TestMapperContext.CreateAsync();
+        var started = Event("evt_task_start", "agent.task.started", taskId: "task_456");
 
-        ProjectAll(mapper, EscalationPath());
+        await context.InsertAndProjectAsync(started);
 
-        var taskSpan = Assert.Single(_stoppedActivities, activity => activity.DisplayName.StartsWith("agent.task", StringComparison.Ordinal));
-        Assert.Contains(taskSpan.Events, activityEvent => activityEvent.Name == "policy.escalated");
-        Assert.Contains(taskSpan.Events, activityEvent => activityEvent.Name == "human.review.requested");
-        Assert.Contains(taskSpan.Events, activityEvent => activityEvent.Name == "human.review.completed");
+        var trace = await context.Repository.GetTraceStateAsync("trace_abc");
+        Assert.NotNull(trace);
+        Assert.Equal("open", trace.Status);
+
+        var root = await context.Repository.GetSpanStateAsync(trace.RootSpanId);
+        Assert.NotNull(root);
+        Assert.Equal("agent.task", root.SpanKind);
+        Assert.Equal("open", root.Status);
+        Assert.Equal("evt_task_start", root.SourceStartEventId);
     }
 
     [Fact]
-    public void Project_DuplicateCompletion_DoesNotCreateDuplicateSpan()
+    public async Task ChildSpan_Persists()
     {
-        var mapper = CreateMapper();
-        var events = HappyPath().ToList();
-        events.Add(Event("evt_tool_done_duplicate", "tool.call.completed", taskId: "task_456", spanId: "span_tool_001"));
-        events.Add(Event("evt_task_done_duplicate", "agent.task.completed", taskId: "task_456"));
+        using var context = await TestMapperContext.CreateAsync();
 
-        var results = events.Select(mapper.Project).ToList();
+        await ProjectAllAsync(context,
+        [
+            Event("evt_task_start", "agent.task.started", taskId: "task_456"),
+            Event("evt_tool_start", "tool.call.started", taskId: "task_456", spanId: "span_tool_001")
+        ]);
 
-        Assert.All(results, result => Assert.True(result.Succeeded));
-        Assert.Single(_stoppedActivities, activity => activity.DisplayName.StartsWith("tool.call", StringComparison.Ordinal));
-        Assert.Single(_stoppedActivities, activity => activity.DisplayName.StartsWith("agent.task", StringComparison.Ordinal));
+        var spans = await context.Repository.GetTraceSpansAsync("trace_abc");
+        var root = Assert.Single(spans, span => span.SpanKind == "agent.task");
+        var child = Assert.Single(spans, span => span.SpanKind == "tool.call");
+
+        Assert.Equal(root.SpanId, child.ParentSpanId);
+        Assert.Equal("open", child.Status);
+        Assert.Equal("evt_tool_start", child.SourceStartEventId);
     }
 
     [Fact]
-    public void Project_OutOfOrderToolStart_ReturnsFailureInsteadOfOrphanSpan()
+    public async Task TaskCompletion_ClosesPersistedRootSpan()
     {
-        var mapper = CreateMapper();
+        using var context = await TestMapperContext.CreateAsync();
 
-        var result = mapper.Project(Event("evt_tool_start", "tool.call.started", taskId: "task_456", spanId: "span_tool_001"));
+        await ProjectAllAsync(context,
+        [
+            Event("evt_task_start", "agent.task.started", taskId: "task_456"),
+            Event("evt_task_done", "agent.task.completed", taskId: "task_456")
+        ]);
 
-        Assert.False(result.Succeeded);
-        Assert.Empty(_stoppedActivities);
+        var trace = await context.Repository.GetTraceStateAsync("trace_abc");
+        Assert.NotNull(trace);
+        Assert.Equal("completed", trace.Status);
+        Assert.NotNull(trace.EndedAt);
+
+        var root = await context.Repository.GetSpanStateAsync(trace.RootSpanId);
+        Assert.NotNull(root);
+        Assert.Equal("completed", root.Status);
+        Assert.Equal("evt_task_done", root.SourceEndEventId);
+        Assert.NotNull(root.EndedAt);
+    }
+
+    [Fact]
+    public async Task ToolFailure_MarksPersistedSpanError()
+    {
+        using var context = await TestMapperContext.CreateAsync();
+
+        await ProjectAllAsync(context,
+        [
+            Event("evt_task_start", "agent.task.started", taskId: "task_456"),
+            Event("evt_tool_start", "tool.call.started", taskId: "task_456", spanId: "span_tool_001"),
+            Event("evt_tool_failed", "tool.call.failed", taskId: "task_456", spanId: "span_tool_001")
+        ]);
+
+        var spans = await context.Repository.GetTraceSpansAsync("trace_abc");
+        var child = Assert.Single(spans, span => span.SpanKind == "tool.call");
+        Assert.Equal("error", child.Status);
+        Assert.Equal("evt_tool_failed", child.SourceEndEventId);
+    }
+
+    [Fact]
+    public async Task RestartRecovery_ReloadsOpenSpans_AndAttachesNewEvents()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"clawindex-recovery-{Guid.NewGuid():N}.db");
+        try
+        {
+            using (var first = await TestMapperContext.CreateAsync(databasePath, deleteOnDispose: false))
+            {
+                await first.InsertAndProjectAsync(Event("evt_task_start", "agent.task.started", taskId: "task_456"));
+            }
+
+            using var recovered = await TestMapperContext.CreateAsync(databasePath, deleteOnDispose: false);
+            var openTraces = await recovered.Repository.GetOpenTraceStatesAsync();
+            var openSpans = await recovered.Repository.GetOpenSpanStatesAsync();
+
+            var trace = Assert.Single(openTraces);
+            var root = Assert.Single(openSpans);
+            Assert.Equal(trace.RootSpanId, root.SpanId);
+
+            await recovered.InsertAndProjectAsync(Event("evt_tool_start", "tool.call.started", taskId: "task_456", spanId: "span_tool_001"));
+
+            var spans = await recovered.Repository.GetTraceSpansAsync("trace_abc");
+            var child = Assert.Single(spans, span => span.SpanKind == "tool.call");
+            Assert.Equal(root.SpanId, child.ParentSpanId);
+        }
+        finally
+        {
+            DeleteDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task DuplicateEventId_DoesNotDuplicateSpanState()
+    {
+        using var context = await TestMapperContext.CreateAsync();
+        var started = Event("evt_task_start", "agent.task.started", taskId: "task_456");
+
+        await context.InsertAndProjectAsync(started);
+        var retry = await context.Mapper.ProjectAsync(started);
+
+        Assert.True(retry.Succeeded, retry.Error);
+        var spans = await context.Repository.GetTraceSpansAsync("trace_abc");
+        Assert.Single(spans);
+        var mapping = await context.Repository.GetEventSpanMapAsync("evt_task_start");
+        Assert.NotNull(mapping);
+        Assert.Equal("source_start", mapping.RelationshipType);
+    }
+
+    [Fact]
+    public async Task DuplicateCompletion_DoesNotCorruptClosedSpan()
+    {
+        using var context = await TestMapperContext.CreateAsync();
+
+        await ProjectAllAsync(context,
+        [
+            Event("evt_task_start", "agent.task.started", taskId: "task_456"),
+            Event("evt_task_done", "agent.task.completed", taskId: "task_456"),
+            Event("evt_task_done_duplicate", "agent.task.completed", taskId: "task_456")
+        ]);
+
+        var trace = await context.Repository.GetTraceStateAsync("trace_abc");
+        Assert.NotNull(trace);
+        Assert.Equal("completed", trace.Status);
+
+        var root = await context.Repository.GetSpanStateAsync(trace.RootSpanId);
+        Assert.NotNull(root);
+        Assert.Equal("completed", root.Status);
+        Assert.Equal("evt_task_done", root.SourceEndEventId);
+
+        var duplicateMapping = await context.Repository.GetEventSpanMapAsync("evt_task_done_duplicate");
+        Assert.NotNull(duplicateMapping);
+        Assert.Equal("duplicate_end", duplicateMapping.RelationshipType);
+    }
+
+    [Fact]
+    public async Task OutOfOrderCompletion_CreatesClosedPlaceholderSafely()
+    {
+        using var context = await TestMapperContext.CreateAsync();
+
+        await context.InsertAndProjectAsync(Event("evt_tool_done", "tool.call.completed", taskId: "task_456", spanId: "span_tool_001"));
+
+        var spans = await context.Repository.GetTraceSpansAsync("trace_abc");
+        var root = Assert.Single(spans, span => span.SpanKind == "agent.task");
+        var child = Assert.Single(spans, span => span.SpanKind == "tool.call");
+
+        Assert.Equal("open", root.Status);
+        Assert.Equal(root.SpanId, child.ParentSpanId);
+        Assert.Equal("completed", child.Status);
+        Assert.Equal("evt_tool_done", child.SourceEndEventId);
+    }
+
+    [Fact]
+    public async Task OrphanPolicyEvent_IsPreservedOnPlaceholderSpan()
+    {
+        using var context = await TestMapperContext.CreateAsync();
+
+        await context.InsertAndProjectAsync(Event("evt_policy", "policy.evaluated", taskId: "task_456"));
+
+        var trace = await context.Repository.GetTraceStateAsync("trace_abc");
+        Assert.NotNull(trace);
+
+        var root = await context.Repository.GetSpanStateAsync(trace.RootSpanId);
+        Assert.NotNull(root);
+        Assert.Equal("open", root.Status);
+
+        var mapping = await context.Repository.GetEventSpanMapAsync("evt_policy");
+        Assert.NotNull(mapping);
+        Assert.Equal(root.SpanId, mapping.SpanId);
+        Assert.Equal("span_event", mapping.RelationshipType);
     }
 
     public void Dispose()
     {
         _listener.Dispose();
+    }
+
+    private static async Task ProjectAllAsync(TestMapperContext context, IEnumerable<AcceptedEvent> events)
+    {
+        foreach (var acceptedEvent in events)
+        {
+            await context.Repository.InsertAsync(acceptedEvent);
+        }
+
+        foreach (var acceptedEvent in events)
+        {
+            var result = await context.Mapper.ProjectAsync(acceptedEvent);
+            Assert.True(result.Succeeded, result.Error);
+        }
     }
 
     private static AcceptedEvent Event(
@@ -142,17 +312,6 @@ public sealed class OtelEventMapperTests : IDisposable
             payload);
     }
 
-    private static OtelEventMapper CreateMapper() => new(NullLogger<OtelEventMapper>.Instance);
-
-    private static void ProjectAll(OtelEventMapper mapper, IEnumerable<AcceptedEvent> events)
-    {
-        foreach (var acceptedEvent in events)
-        {
-            var result = mapper.Project(acceptedEvent);
-            Assert.True(result.Succeeded, result.Error);
-        }
-    }
-
     private static IEnumerable<AcceptedEvent> HappyPath()
     {
         yield return Event("evt_task_start", "agent.task.started", taskId: "task_456");
@@ -170,12 +329,64 @@ public sealed class OtelEventMapperTests : IDisposable
         yield return Event("evt_task_failed", "agent.task.failed", taskId: "task_456");
     }
 
-    private static IEnumerable<AcceptedEvent> EscalationPath()
+    private static void DeleteDatabase(string databasePath)
     {
-        yield return Event("evt_task_start", "agent.task.started", taskId: "task_456");
-        yield return Event("evt_policy_escalated", "policy.escalated", taskId: "task_456");
-        yield return Event("evt_review_requested", "human.review.requested", taskId: "task_456");
-        yield return Event("evt_review_completed", "human.review.completed", taskId: "task_456");
-        yield return Event("evt_task_done", "agent.task.completed", taskId: "task_456");
+        foreach (var path in new[] { databasePath, $"{databasePath}-shm", $"{databasePath}-wal" })
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+    }
+
+    private sealed class TestMapperContext : IDisposable
+    {
+        private readonly bool _deleteOnDispose;
+
+        private TestMapperContext(string databasePath, EventRepository repository, OtelEventMapper mapper, bool deleteOnDispose)
+        {
+            DatabasePath = databasePath;
+            Repository = repository;
+            Mapper = mapper;
+            _deleteOnDispose = deleteOnDispose;
+        }
+
+        public string DatabasePath { get; }
+
+        public EventRepository Repository { get; }
+
+        public OtelEventMapper Mapper { get; }
+
+        public static async Task<TestMapperContext> CreateAsync(string? databasePath = null, bool deleteOnDispose = true)
+        {
+            databasePath ??= Path.Combine(Path.GetTempPath(), $"clawindex-mapper-tests-{Guid.NewGuid():N}.db");
+            var configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Clawindex:DatabasePath"] = databasePath
+                })
+                .Build();
+            var repository = new EventRepository(configuration);
+            await repository.InitializeAsync();
+            var mapper = new OtelEventMapper(repository, NullLogger<OtelEventMapper>.Instance);
+
+            return new TestMapperContext(databasePath, repository, mapper, deleteOnDispose);
+        }
+
+        public async Task InsertAndProjectAsync(AcceptedEvent acceptedEvent)
+        {
+            await Repository.InsertAsync(acceptedEvent);
+            var result = await Mapper.ProjectAsync(acceptedEvent);
+            Assert.True(result.Succeeded, result.Error);
+        }
+
+        public void Dispose()
+        {
+            if (_deleteOnDispose)
+            {
+                DeleteDatabase(DatabasePath);
+            }
+        }
     }
 }

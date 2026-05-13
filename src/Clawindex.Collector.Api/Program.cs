@@ -29,6 +29,12 @@ using (var scope = app.Services.CreateScope())
 {
     var repository = scope.ServiceProvider.GetRequiredService<EventRepository>();
     await repository.InitializeAsync();
+    var openTraces = await repository.GetOpenTraceStatesAsync();
+    var openSpans = await repository.GetOpenSpanStatesAsync();
+    app.Logger.LogInformation(
+        "Recovered durable span state with {OpenTraceCount} open traces and {OpenSpanCount} open spans.",
+        openTraces.Count,
+        openSpans.Count);
 }
 
 app.MapGet("/v1/health", () => Results.Ok(new
