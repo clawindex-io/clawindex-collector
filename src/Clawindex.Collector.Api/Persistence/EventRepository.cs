@@ -37,12 +37,18 @@ public sealed class EventRepository(IConfiguration configuration)
               session_id TEXT NULL,
               raw_json TEXT NOT NULL,
               payload_json TEXT NOT NULL,
-              projected_at TEXT NULL
+              projection_status TEXT NOT NULL DEFAULT 'pending',
+              projected_at TEXT NULL,
+              exported_at TEXT NULL,
+              projection_attempts INTEGER NOT NULL DEFAULT 0,
+              projection_errors TEXT NULL
             );
             """;
 
         await command.ExecuteNonQueryAsync();
-        await EnsureProjectedAtColumnAsync(connection);
+        await EnsureProjectionColumnsAsync(connection);
+        await BackfillProjectionStatusAsync(connection);
+        await ResetInProgressProjectionsAsync(connection);
     }
 
     public async Task InsertAsync(AcceptedEvent acceptedEvent)
@@ -96,7 +102,10 @@ public sealed class EventRepository(IConfiguration configuration)
         return ReadAcceptedEvent(reader);
     }
 
-    public async Task<IReadOnlyList<AcceptedEvent>> GetUnprojectedAsync(int limit, CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<AcceptedEvent>> GetUnprojectedAsync(
+        int limit,
+        int maxAttempts = 3,
+        CancellationToken cancellationToken = default)
     {
         await using var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
@@ -109,11 +118,13 @@ public sealed class EventRepository(IConfiguration configuration)
                    trace_id, span_id, task_id, agent_id, session_id,
                    raw_json, payload_json
             FROM events
-            WHERE projected_at IS NULL
+            WHERE projection_status IN ('pending', 'failed')
+              AND projection_attempts < $max_attempts
             ORDER BY received_at, occurred_at
             LIMIT $limit;
             """;
         command.Parameters.AddWithValue("$limit", limit);
+        command.Parameters.AddWithValue("$max_attempts", maxAttempts);
 
         var events = new List<AcceptedEvent>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -134,11 +145,56 @@ public sealed class EventRepository(IConfiguration configuration)
         command.CommandText =
             """
             UPDATE events
-            SET projected_at = $projected_at
+            SET projection_status = 'projected',
+                projected_at = $projected_at,
+                exported_at = $projected_at,
+                projection_errors = NULL
             WHERE event_id = $event_id;
             """;
         command.Parameters.AddWithValue("$event_id", eventId);
         command.Parameters.AddWithValue("$projected_at", DateTimeOffset.UtcNow.ToString("O"));
+
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task MarkProjectionAttemptAsync(string eventId, CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE events
+            SET projection_status = 'in_progress',
+                projection_attempts = projection_attempts + 1,
+                projection_errors = NULL
+            WHERE event_id = $event_id
+              AND projection_status IN ('pending', 'failed');
+            """;
+        command.Parameters.AddWithValue("$event_id", eventId);
+
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task MarkProjectionFailedAsync(
+        string eventId,
+        string error,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE events
+            SET projection_status = 'failed',
+                projection_errors = $projection_errors
+            WHERE event_id = $event_id;
+            """;
+        command.Parameters.AddWithValue("$event_id", eventId);
+        command.Parameters.AddWithValue("$projection_errors", error);
 
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
@@ -152,6 +208,35 @@ public sealed class EventRepository(IConfiguration configuration)
         command.CommandText = "SELECT COUNT(*) FROM events;";
         var count = await command.ExecuteScalarAsync();
         return Convert.ToInt32(count);
+    }
+
+    public async Task<ProjectionState?> GetProjectionStateAsync(string eventId)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT event_id, projection_status, projected_at, exported_at, projection_attempts, projection_errors
+            FROM events
+            WHERE event_id = $event_id;
+            """;
+        command.Parameters.AddWithValue("$event_id", eventId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            return null;
+        }
+
+        return new ProjectionState(
+            reader.GetString(0),
+            reader.GetString(1),
+            ReadNullableDateTimeOffset(reader, 2),
+            ReadNullableDateTimeOffset(reader, 3),
+            reader.GetInt32(4),
+            ReadNullableString(reader, 5));
     }
 
     private static SqliteCommand CreateInsertCommand(SqliteConnection connection, AcceptedEvent acceptedEvent)
@@ -217,32 +302,70 @@ public sealed class EventRepository(IConfiguration configuration)
     private static string? ReadNullableString(SqliteDataReader reader, int ordinal) =>
         reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
 
-    private static async Task EnsureProjectedAtColumnAsync(SqliteConnection connection)
+    private static DateTimeOffset? ReadNullableDateTimeOffset(SqliteDataReader reader, int ordinal) =>
+        reader.IsDBNull(ordinal) ? null : DateTimeOffset.Parse(reader.GetString(ordinal));
+
+    private static async Task EnsureProjectionColumnsAsync(SqliteConnection connection)
     {
         await using var columnsCommand = connection.CreateCommand();
         columnsCommand.CommandText = "PRAGMA table_info(events);";
 
-        var hasColumn = false;
+        var columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         await using (var reader = await columnsCommand.ExecuteReaderAsync())
         {
             while (await reader.ReadAsync())
             {
-                if (string.Equals(reader.GetString(1), "projected_at", StringComparison.OrdinalIgnoreCase))
-                {
-                    hasColumn = true;
-                    break;
-                }
+                columns.Add(reader.GetString(1));
             }
         }
 
-        if (hasColumn)
+        await AddColumnIfMissingAsync(connection, columns, "projection_status", "TEXT NOT NULL DEFAULT 'pending'");
+        await AddColumnIfMissingAsync(connection, columns, "projected_at", "TEXT NULL");
+        await AddColumnIfMissingAsync(connection, columns, "exported_at", "TEXT NULL");
+        await AddColumnIfMissingAsync(connection, columns, "projection_attempts", "INTEGER NOT NULL DEFAULT 0");
+        await AddColumnIfMissingAsync(connection, columns, "projection_errors", "TEXT NULL");
+    }
+
+    private static async Task AddColumnIfMissingAsync(
+        SqliteConnection connection,
+        HashSet<string> columns,
+        string columnName,
+        string columnDefinition)
+    {
+        if (columns.Contains(columnName))
         {
             return;
         }
 
         await using var alterCommand = connection.CreateCommand();
-        alterCommand.CommandText = "ALTER TABLE events ADD COLUMN projected_at TEXT NULL;";
+        alterCommand.CommandText = $"ALTER TABLE events ADD COLUMN {columnName} {columnDefinition};";
         await alterCommand.ExecuteNonQueryAsync();
+    }
+
+    private static async Task ResetInProgressProjectionsAsync(SqliteConnection connection)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE events
+            SET projection_status = 'pending'
+            WHERE projection_status = 'in_progress';
+            """;
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task BackfillProjectionStatusAsync(SqliteConnection connection)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE events
+            SET projection_status = 'projected',
+                exported_at = COALESCE(exported_at, projected_at)
+            WHERE projected_at IS NOT NULL
+              AND projection_status = 'pending';
+            """;
+        await command.ExecuteNonQueryAsync();
     }
 
     private static string BuildConnectionString(IConfiguration configuration)

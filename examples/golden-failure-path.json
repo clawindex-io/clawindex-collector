@@ -1,0 +1,62 @@
+{
+  "events": [
+    {
+      "schema_version": "0.1.0",
+      "event_id": "evt_golden_failure_task_start",
+      "event_type": "agent.task.started",
+      "occurred_at": "2026-05-11T22:20:00Z",
+      "source": { "system": "test-agent", "component": "planner", "version": "0.1.0" },
+      "correlation": {
+        "trace_id": "7bf92f3577b34da6a3ce929d0e0e4736",
+        "task_id": "task_golden_failure",
+        "agent_id": "agent_soil_report",
+        "session_id": "session_golden"
+      },
+      "payload": { "task_name": "Generate soil report" }
+    },
+    {
+      "schema_version": "0.1.0",
+      "event_id": "evt_golden_failure_tool_start",
+      "event_type": "tool.call.started",
+      "occurred_at": "2026-05-11T22:20:02Z",
+      "source": { "system": "agent-runtime", "component": "tool-router", "version": "0.1.0" },
+      "correlation": {
+        "trace_id": "7bf92f3577b34da6a3ce929d0e0e4736",
+        "span_id": "10f067aa0ba902b7",
+        "task_id": "task_golden_failure",
+        "agent_id": "agent_soil_report",
+        "session_id": "session_golden"
+      },
+      "payload": { "tool_name": "calculate_recommendation", "side_effect_type": "none" }
+    },
+    {
+      "schema_version": "0.1.0",
+      "event_id": "evt_golden_failure_tool_failed",
+      "event_type": "tool.call.failed",
+      "occurred_at": "2026-05-11T22:20:05Z",
+      "source": { "system": "agent-runtime", "component": "tool-router", "version": "0.1.0" },
+      "correlation": {
+        "trace_id": "7bf92f3577b34da6a3ce929d0e0e4736",
+        "span_id": "10f067aa0ba902b7",
+        "task_id": "task_golden_failure",
+        "agent_id": "agent_soil_report",
+        "session_id": "session_golden"
+      },
+      "payload": { "tool_name": "calculate_recommendation", "side_effect_type": "none", "error": "tool timeout" }
+    },
+    {
+      "schema_version": "0.1.0",
+      "event_id": "evt_golden_failure_task_failed",
+      "event_type": "agent.task.failed",
+      "occurred_at": "2026-05-11T22:20:06Z",
+      "source": { "system": "test-agent", "component": "planner", "version": "0.1.0" },
+      "correlation": {
+        "trace_id": "7bf92f3577b34da6a3ce929d0e0e4736",
+        "task_id": "task_golden_failure",
+        "agent_id": "agent_soil_report",
+        "session_id": "session_golden"
+      },
+      "payload": { "task_name": "Generate soil report", "error": "tool timeout" }
+    }
+  ]
+}
