@@ -284,7 +284,33 @@ public sealed class CollectorApiTests
         var unprojected = await fixture.Repository.GetUnprojectedAsync(10);
         Assert.Contains(unprojected, item => item.EventId == "evt_projection_test");
 
+        await fixture.Repository.MarkProjectionAttemptAsync("evt_projection_test");
+        var state = await fixture.Repository.GetProjectionStateAsync("evt_projection_test");
+        Assert.NotNull(state);
+        Assert.Equal("in_progress", state.ProjectionStatus);
+        Assert.Equal(1, state.ProjectionAttempts);
+
+        await fixture.Repository.MarkProjectionFailedAsync("evt_projection_test", "missing parent");
+        state = await fixture.Repository.GetProjectionStateAsync("evt_projection_test");
+        Assert.NotNull(state);
+        Assert.Equal("failed", state.ProjectionStatus);
+        Assert.Equal("missing parent", state.ProjectionErrors);
+
+        await fixture.Repository.MarkProjectionAttemptAsync("evt_projection_test");
+        await fixture.Repository.MarkProjectionFailedAsync("evt_projection_test", "still missing parent");
+        await fixture.Repository.MarkProjectionAttemptAsync("evt_projection_test");
+        await fixture.Repository.MarkProjectionFailedAsync("evt_projection_test", "still missing parent");
+
+        unprojected = await fixture.Repository.GetUnprojectedAsync(10, maxAttempts: 3);
+        Assert.DoesNotContain(unprojected, item => item.EventId == "evt_projection_test");
+
         await fixture.Repository.MarkProjectedAsync("evt_projection_test");
+        state = await fixture.Repository.GetProjectionStateAsync("evt_projection_test");
+        Assert.NotNull(state);
+        Assert.Equal("projected", state.ProjectionStatus);
+        Assert.NotNull(state.ProjectedAt);
+        Assert.NotNull(state.ExportedAt);
+        Assert.Null(state.ProjectionErrors);
 
         unprojected = await fixture.Repository.GetUnprojectedAsync(10);
         Assert.DoesNotContain(unprojected, item => item.EventId == "evt_projection_test");

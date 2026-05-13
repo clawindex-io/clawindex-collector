@@ -23,11 +23,35 @@ public sealed class OtelProjectionWorker(
         {
             try
             {
-                var events = await repository.GetUnprojectedAsync(options.Value.BatchSize, stoppingToken);
+                var events = await repository.GetUnprojectedAsync(
+                    options.Value.BatchSize,
+                    options.Value.MaxAttempts,
+                    stoppingToken);
                 foreach (var acceptedEvent in events)
                 {
-                    mapper.Project(acceptedEvent);
-                    await repository.MarkProjectedAsync(acceptedEvent.EventId, stoppingToken);
+                    await repository.MarkProjectionAttemptAsync(acceptedEvent.EventId, stoppingToken);
+                    var result = mapper.Project(acceptedEvent);
+                    if (result.Succeeded)
+                    {
+                        await repository.MarkProjectedAsync(acceptedEvent.EventId, stoppingToken);
+                        logger.LogDebug(
+                            "Projected event {EventId} of type {EventType} for trace {TraceId}",
+                            acceptedEvent.EventId,
+                            acceptedEvent.EventType,
+                            acceptedEvent.TraceId);
+                        continue;
+                    }
+
+                    await repository.MarkProjectionFailedAsync(
+                        acceptedEvent.EventId,
+                        result.Error ?? "Projection failed.",
+                        stoppingToken);
+                    logger.LogWarning(
+                        "Projection failed for event {EventId} of type {EventType} for trace {TraceId}: {ProjectionError}",
+                        acceptedEvent.EventId,
+                        acceptedEvent.EventType,
+                        acceptedEvent.TraceId,
+                        result.Error);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

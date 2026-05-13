@@ -7,53 +7,64 @@ using Clawindex.Collector.Api.Persistence;
 
 namespace Clawindex.Collector.Api.Projection;
 
-public sealed class OtelEventMapper
+public sealed class OtelEventMapper(ILogger<OtelEventMapper> logger)
 {
     private readonly Dictionary<string, Activity> _activeTasks = [];
     private readonly Dictionary<string, Activity> _activeTools = [];
     private readonly Dictionary<string, Activity> _activeToolByTask = [];
+    private readonly HashSet<string> _completedTasks = [];
+    private readonly HashSet<string> _completedTools = [];
 
-    public void Project(AcceptedEvent acceptedEvent)
+    public ProjectionResult Project(AcceptedEvent acceptedEvent)
     {
         switch (acceptedEvent.EventType)
         {
             case "agent.task.started":
-                StartTaskSpan(acceptedEvent);
-                break;
+                return StartTaskSpan(acceptedEvent);
             case "agent.task.completed":
-                StopTaskSpan(acceptedEvent, ActivityStatusCode.Ok);
-                break;
+                return StopTaskSpan(acceptedEvent, ActivityStatusCode.Ok);
             case "agent.task.failed":
-                StopTaskSpan(acceptedEvent, ActivityStatusCode.Error);
-                break;
+                return StopTaskSpan(acceptedEvent, ActivityStatusCode.Error);
             case "tool.call.started":
-                StartToolSpan(acceptedEvent);
-                break;
+                return StartToolSpan(acceptedEvent);
             case "tool.call.completed":
-                StopToolSpan(acceptedEvent, ActivityStatusCode.Ok);
-                break;
+                return StopToolSpan(acceptedEvent, ActivityStatusCode.Ok);
             case "tool.call.failed":
-                StopToolSpan(acceptedEvent, ActivityStatusCode.Error);
-                break;
+                return StopToolSpan(acceptedEvent, ActivityStatusCode.Error);
             case "policy.evaluated":
             case "policy.denied":
             case "policy.escalated":
             case "human.review.requested":
             case "human.review.completed":
                 AddSpanEvent(acceptedEvent);
-                break;
+                return ProjectionResult.Success();
             default:
                 EmitInstantSpan(acceptedEvent);
-                break;
+                return ProjectionResult.Success();
         }
     }
 
-    private void StartTaskSpan(AcceptedEvent acceptedEvent)
+    private ProjectionResult StartTaskSpan(AcceptedEvent acceptedEvent)
     {
         var key = TaskKey(acceptedEvent);
         if (_activeTasks.ContainsKey(key))
         {
-            return;
+            logger.LogWarning(
+                "Duplicate active task start skipped for event {EventId}, task {TaskId}, trace {TraceId}",
+                acceptedEvent.EventId,
+                acceptedEvent.TaskId,
+                acceptedEvent.TraceId);
+            return ProjectionResult.Success();
+        }
+
+        if (_completedTasks.Contains(key))
+        {
+            logger.LogWarning(
+                "Task start skipped because task is already completed for event {EventId}, task {TaskId}, trace {TraceId}",
+                acceptedEvent.EventId,
+                acceptedEvent.TaskId,
+                acceptedEvent.TraceId);
+            return ProjectionResult.Success();
         }
 
         var activity = ClawindexTelemetry.ActivitySource.StartActivity(
@@ -65,49 +76,90 @@ public sealed class OtelEventMapper
 
         if (activity is null)
         {
-            return;
+            return ProjectionResult.Failure("ActivitySource did not create task activity.");
         }
 
         _activeTasks[key] = activity;
+        return ProjectionResult.Success();
     }
 
-    private void StopTaskSpan(AcceptedEvent acceptedEvent, ActivityStatusCode statusCode)
+    private ProjectionResult StopTaskSpan(AcceptedEvent acceptedEvent, ActivityStatusCode statusCode)
     {
         var key = TaskKey(acceptedEvent);
+        if (_completedTasks.Contains(key))
+        {
+            logger.LogWarning(
+                "Duplicate task completion skipped for event {EventId}, task {TaskId}, trace {TraceId}",
+                acceptedEvent.EventId,
+                acceptedEvent.TaskId,
+                acceptedEvent.TraceId);
+            return ProjectionResult.Success();
+        }
+
         if (!_activeTasks.Remove(key, out var activity))
         {
-            EmitInstantSpan(acceptedEvent, "agent.task", statusCode);
-            return;
+            logger.LogWarning(
+                "Task completion has no active task span for event {EventId}, task {TaskId}, trace {TraceId}",
+                acceptedEvent.EventId,
+                acceptedEvent.TaskId,
+                acceptedEvent.TraceId);
+            return ProjectionResult.Failure("Task completion has no active task span.");
         }
 
         activity.SetStatus(statusCode);
         AddCompletionTags(activity, acceptedEvent);
         activity.SetEndTime(acceptedEvent.OccurredAt.UtcDateTime);
         activity.Stop();
+        _completedTasks.Add(key);
+        return ProjectionResult.Success();
     }
 
-    private void StartToolSpan(AcceptedEvent acceptedEvent)
+    private ProjectionResult StartToolSpan(AcceptedEvent acceptedEvent)
     {
         var key = ToolKey(acceptedEvent);
         if (_activeTools.ContainsKey(key))
         {
-            return;
+            logger.LogWarning(
+                "Duplicate active tool start skipped for event {EventId}, span {SpanId}, task {TaskId}, trace {TraceId}",
+                acceptedEvent.EventId,
+                acceptedEvent.SpanId,
+                acceptedEvent.TaskId,
+                acceptedEvent.TraceId);
+            return ProjectionResult.Success();
         }
 
-        var parentContext = _activeTasks.TryGetValue(TaskKey(acceptedEvent), out var taskActivity)
-            ? taskActivity.Context
-            : CreateParentContext(acceptedEvent);
+        if (_completedTools.Contains(key))
+        {
+            logger.LogWarning(
+                "Tool start skipped because tool is already completed for event {EventId}, span {SpanId}, task {TaskId}, trace {TraceId}",
+                acceptedEvent.EventId,
+                acceptedEvent.SpanId,
+                acceptedEvent.TaskId,
+                acceptedEvent.TraceId);
+            return ProjectionResult.Success();
+        }
+
+        if (!_activeTasks.TryGetValue(TaskKey(acceptedEvent), out var taskActivity))
+        {
+            logger.LogWarning(
+                "Tool start has no active parent task span for event {EventId}, span {SpanId}, task {TaskId}, trace {TraceId}",
+                acceptedEvent.EventId,
+                acceptedEvent.SpanId,
+                acceptedEvent.TaskId,
+                acceptedEvent.TraceId);
+            return ProjectionResult.Failure("Tool start has no active parent task span.");
+        }
 
         var activity = ClawindexTelemetry.ActivitySource.StartActivity(
             $"tool.call {PayloadString(acceptedEvent, "tool_name") ?? acceptedEvent.EventId}",
             ActivityKind.Internal,
-            parentContext,
+            taskActivity.Context,
             CreateTags(acceptedEvent, "tool.call"),
             startTime: acceptedEvent.OccurredAt);
 
         if (activity is null)
         {
-            return;
+            return ProjectionResult.Failure("ActivitySource did not create tool activity.");
         }
 
         _activeTools[key] = activity;
@@ -115,15 +167,33 @@ public sealed class OtelEventMapper
         {
             _activeToolByTask[TaskKey(acceptedEvent)] = activity;
         }
+
+        return ProjectionResult.Success();
     }
 
-    private void StopToolSpan(AcceptedEvent acceptedEvent, ActivityStatusCode statusCode)
+    private ProjectionResult StopToolSpan(AcceptedEvent acceptedEvent, ActivityStatusCode statusCode)
     {
         var key = ToolKey(acceptedEvent);
+        if (_completedTools.Contains(key))
+        {
+            logger.LogWarning(
+                "Duplicate tool completion skipped for event {EventId}, span {SpanId}, task {TaskId}, trace {TraceId}",
+                acceptedEvent.EventId,
+                acceptedEvent.SpanId,
+                acceptedEvent.TaskId,
+                acceptedEvent.TraceId);
+            return ProjectionResult.Success();
+        }
+
         if (!_activeTools.Remove(key, out var activity))
         {
-            EmitInstantSpan(acceptedEvent, "tool.call", statusCode);
-            return;
+            logger.LogWarning(
+                "Tool completion has no active tool span for event {EventId}, span {SpanId}, task {TaskId}, trace {TraceId}",
+                acceptedEvent.EventId,
+                acceptedEvent.SpanId,
+                acceptedEvent.TaskId,
+                acceptedEvent.TraceId);
+            return ProjectionResult.Failure("Tool completion has no active tool span.");
         }
 
         if (!string.IsNullOrWhiteSpace(acceptedEvent.TaskId))
@@ -135,6 +205,8 @@ public sealed class OtelEventMapper
         AddCompletionTags(activity, acceptedEvent);
         activity.SetEndTime(acceptedEvent.OccurredAt.UtcDateTime);
         activity.Stop();
+        _completedTools.Add(key);
+        return ProjectionResult.Success();
     }
 
     private void AddSpanEvent(AcceptedEvent acceptedEvent)
@@ -152,6 +224,13 @@ public sealed class OtelEventMapper
             target.AddEvent(new ActivityEvent(acceptedEvent.EventType, acceptedEvent.OccurredAt, ToActivityTags(tags)));
             return;
         }
+
+        logger.LogWarning(
+            "Span event has no active parent span for event {EventId}, event type {EventType}, task {TaskId}, trace {TraceId}",
+            acceptedEvent.EventId,
+            acceptedEvent.EventType,
+            acceptedEvent.TaskId,
+            acceptedEvent.TraceId);
 
         using var activity = StartFallbackActivity(acceptedEvent, "clawindex.event", ActivityStatusCode.Ok);
         activity?.AddEvent(new ActivityEvent(acceptedEvent.EventType, acceptedEvent.OccurredAt, ToActivityTags(tags)));

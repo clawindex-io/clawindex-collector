@@ -127,6 +127,22 @@ curl -X POST http://localhost:5000/v1/events/batch \
   --data-binary @examples/phase1-correlated-trace.json
 ```
 
+Golden trace fixtures:
+
+```bash
+curl -X POST http://localhost:5000/v1/events/batch \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/golden-happy-path.json
+
+curl -X POST http://localhost:5000/v1/events/batch \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/golden-failure-path.json
+
+curl -X POST http://localhost:5000/v1/events/batch \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/golden-escalation-path.json
+```
+
 For Docker Compose, replace `localhost:5000` with `localhost:8080`.
 
 ## Viewing Traces In Aspire
@@ -144,6 +160,12 @@ Expected shape:
 - `policy.evaluated` appears as a span event on the active tool span.
 - Clawindex correlation appears as attributes such as `clawindex.trace_id`, `clawindex.task_id`, and `clawindex.agent_id`.
 
+Golden topology checks:
+
+- Happy path: one root task span, one nested tool span, one policy event on the tool span.
+- Failure path: task and tool spans both end with error status.
+- Escalation path: policy escalation and human review events appear on the task span.
+
 Clawindex IDs that are already valid W3C trace/span IDs are used directly. Non-W3C IDs, such as `trace_abc`, are preserved as `clawindex.trace_id` and mapped to stable valid OTel IDs for export.
 
 ## Inspecting SQLite
@@ -153,7 +175,7 @@ Use the same path passed to `CLAWINDEX_DB_PATH`.
 ```bash
 sqlite3 ./data/clawindex-collector.db '.schema events'
 sqlite3 ./data/clawindex-collector.db 'select count(*) from events;'
-sqlite3 ./data/clawindex-collector.db 'select event_id, event_type, source_system, trace_id, task_id, received_at, projected_at from events order by received_at;'
+sqlite3 ./data/clawindex-collector.db 'select event_id, event_type, source_system, trace_id, task_id, received_at, projection_status, projection_attempts, projected_at, projection_errors from events order by received_at;'
 ```
 
 Check raw JSON preservation:
@@ -166,7 +188,19 @@ Inspect the Docker Compose SQLite volume:
 
 ```bash
 docker run --rm -v pulse-collector_clawindex-data:/data alpine:latest \
-  sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /data/clawindex-collector.db 'select event_type, trace_id, task_id, projected_at from events order by received_at;'"
+  sh -c "apk add --no-cache sqlite >/dev/null && sqlite3 /data/clawindex-collector.db 'select event_type, trace_id, task_id, projection_status, projection_attempts, projected_at from events order by received_at;'"
+```
+
+Reset local SQLite:
+
+```bash
+rm -f ./data/clawindex-collector.db ./data/clawindex-collector.db-shm ./data/clawindex-collector.db-wal
+```
+
+Reset Docker SQLite volume:
+
+```bash
+docker compose down -v
 ```
 
 ## OTLP Configuration
@@ -193,7 +227,8 @@ Projection worker settings live under `Clawindex:Projection`:
     "Projection": {
       "Enabled": true,
       "PollIntervalMilliseconds": 1000,
-      "BatchSize": 100
+      "BatchSize": 100,
+      "MaxAttempts": 3
     }
   }
 }
@@ -204,7 +239,10 @@ Projection worker settings live under `Clawindex:Projection`:
 - No traces in Aspire: make sure Aspire is running before posting events and `OTEL_EXPORTER_OTLP_ENDPOINT` points to `http://localhost:4317` locally.
 - Started-only events do not appear as completed spans: post `examples/phase1-correlated-trace.json`, which includes completion events.
 - Docker traces missing: run `docker compose logs clawindex-collector` and confirm the collector is using `http://aspire-dashboard:18889`.
-- SQLite has rows but no projection: inspect `projected_at`; null values indicate the worker has not marked rows projected yet.
+- SQLite has rows but no projection: inspect `projection_status`, `projection_attempts`, `projected_at`, and `projection_errors`.
+- Missing parent spans: check collector logs for structured warnings containing `EventId`, `TraceId`, `TaskId`, and `SpanId`.
+- Out-of-order lifecycle events: projection retries failed rows up to `Clawindex:Projection:MaxAttempts`; rows that still cannot be correlated stay `failed` with `projection_errors`.
+- Duplicate completion events: duplicates are marked projected but do not emit duplicate task/tool spans.
 - Aspire login prompt: the README and Compose commands set `ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true` for local development.
 
 ## Test
