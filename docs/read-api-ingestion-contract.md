@@ -76,3 +76,14 @@ Gaming the integration (placeholder GUIDs, missing token counts, stub attributes
 - Persistence schema changes (separate issue).
 - Cost/pricing enrichment and the executive/ROI view (P2, depends on token fields defined here).
 - Any cross-tenant aggregation (forbidden by invariant).
+
+## Amendment: SemConv Transition Tolerance
+
+The OpenTelemetry GenAI Semantic Conventions are in Development status and mid-transition. Some floor attributes have a current key and a prior key, and both are emitted in the wild depending on whether an integrator has opted into the newer convention version. To avoid penalizing conformant integrators for the convention's transition timing, the conformance floor is **tolerant** on transitioning attributes:
+
+- A floor attribute is satisfied if either its current key or its accepted prior key is present and valid.
+- The current key is preferred when both are present.
+- Provider: accept `gen_ai.provider.name` (current, preferred) or `gen_ai.system` (prior).
+- Token and other floor values are read tolerantly with respect to representation (integer or string-encoded integer), since emitters vary.
+
+This tolerance is a transition measure. Prior keys carry a documented sunset and will be dropped once the GenAI conventions stabilize and the installed base has migrated. Until then, accepting both is the honest implementation of the OTel-first promise: an integrator pointing a current OTel stack at ClawIndex should be counted conformant regardless of which convention version their instrumentation defaults to.
