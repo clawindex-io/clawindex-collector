@@ -1,7 +1,10 @@
 using System.Text.Json;
 using Clawindex.Collector.Api;
+using Clawindex.Collector.Api.Otlp;
 using Clawindex.Collector.Api.Persistence;
 using Clawindex.Collector.Api.Projection;
+using Google.Protobuf;
+using OpenTelemetry.Proto.Collector.Trace.V1;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
@@ -13,6 +16,10 @@ builder.Services.AddSingleton<EventRepository>();
 builder.Services.AddSingleton<OtelEventMapper>();
 builder.Services.Configure<OtelProjectionOptions>(builder.Configuration.GetSection("Clawindex:Projection"));
 builder.Services.AddHostedService<OtelProjectionWorker>();
+builder.Services.AddSingleton<SpanFlattener>();
+builder.Services.AddSingleton<SemConvConformanceValidator>();
+builder.Services.AddSingleton<InMemorySpanSink>();
+builder.Services.AddSingleton<IValidatedSpanSink>(sp => sp.GetRequiredService<InMemorySpanSink>());
 builder.Services.AddOpenApi();
 builder.Services.AddOpenTelemetry()
     .ConfigureResource(resource => resource.AddService(ClawindexTelemetry.ServiceName, serviceVersion: "0.1.0"))
@@ -51,6 +58,64 @@ app.MapGet("/v1/schema", () => Results.Ok(new
 }));
 
 app.MapOpenApi();
+
+app.MapPost("/v1/traces", async (
+    HttpRequest request,
+    SpanFlattener flattener,
+    SemConvConformanceValidator validator,
+    IValidatedSpanSink sink,
+    CancellationToken cancellationToken) =>
+{
+    var rawBody = await ReadBinaryBodyAsync(request);
+    if (rawBody.Length == 0)
+    {
+        return Results.BadRequest(Rejected("Request body must not be empty"));
+    }
+
+    ExportTraceServiceRequest otlpRequest;
+    try
+    {
+        otlpRequest = ExportTraceServiceRequest.Parser.ParseFrom(rawBody);
+    }
+    catch (InvalidProtocolBufferException)
+    {
+        return Results.BadRequest(Rejected("Request body is not a valid ExportTraceServiceRequest protobuf"));
+    }
+
+    var flatSpans = flattener.Flatten(otlpRequest);
+    var validatedSpans = new List<ValidatedSpan>(flatSpans.Count);
+    var rejectedCount = 0;
+
+    foreach (var flat in flatSpans)
+    {
+        var result = validator.Validate(flat);
+        if (!result.IsEnvelopeValid)
+        {
+            rejectedCount++;
+        }
+        else
+        {
+            validatedSpans.Add(result.Span!);
+        }
+    }
+
+    if (validatedSpans.Count > 0)
+    {
+        await sink.AcceptAsync(validatedSpans, cancellationToken);
+    }
+
+    var response = new ExportTraceServiceResponse();
+    if (rejectedCount > 0)
+    {
+        response.PartialSuccess = new ExportTracePartialSuccess
+        {
+            RejectedSpans = rejectedCount,
+            ErrorMessage = $"{rejectedCount} span(s) rejected: missing required identity fields (trace_id, span_id, name, or start_time)."
+        };
+    }
+
+    return Results.Bytes(response.ToByteArray(), "application/x-protobuf");
+});
 
 app.MapPost("/v1/events", async (
     HttpRequest request,
@@ -163,6 +228,13 @@ static async Task<string> ReadBodyAsync(HttpRequest request)
 {
     using var reader = new StreamReader(request.Body);
     return await reader.ReadToEndAsync();
+}
+
+static async Task<byte[]> ReadBinaryBodyAsync(HttpRequest request)
+{
+    using var ms = new MemoryStream();
+    await request.Body.CopyToAsync(ms);
+    return ms.ToArray();
 }
 
 static bool TryParseObject(string rawBody, out JsonDocument document, out string error)
