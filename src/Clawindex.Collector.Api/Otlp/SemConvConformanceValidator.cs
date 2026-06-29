@@ -1,5 +1,3 @@
-using Google.Protobuf;
-
 namespace Clawindex.Collector.Api.Otlp;
 
 public sealed class SemConvConformanceValidator
