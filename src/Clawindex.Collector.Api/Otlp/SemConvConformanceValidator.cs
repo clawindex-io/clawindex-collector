@@ -1,0 +1,106 @@
+namespace Clawindex.Collector.Api.Otlp;
+
+public sealed class SemConvConformanceValidator
+{
+    private static readonly Guid NilGuid = Guid.Empty;
+    private static readonly Guid SentinelGuid = new("00000000-0000-0000-0000-000000000001");
+
+    public ValidationResult Validate(FlatSpan flatSpan)
+    {
+        var span = flatSpan.Span;
+        var attrs = flatSpan.Attributes;
+
+        // Tier 1 — envelope-valid
+        if (span.TraceId.IsEmpty || span.TraceId.Length != 16 ||
+            span.SpanId.IsEmpty || span.SpanId.Length != 8 ||
+            string.IsNullOrEmpty(span.Name) ||
+            span.StartTimeUnixNano == 0)
+        {
+            return ValidationResult.EnvelopeInvalid(
+                "Span is missing required identity fields (trace_id, span_id, name, or start_time).");
+        }
+
+        var rawAttributes = attrs
+            .Select(kv => new KeyValuePair<string, string>(kv.Key, kv.Value))
+            .ToList();
+
+        // Tier 2 — conformance-complete
+        // Provider: tolerant — gen_ai.provider.name (current, preferred) or gen_ai.system (prior)
+        var provider = GetNonEmpty(attrs, "gen_ai.provider.name") ?? GetNonEmpty(attrs, "gen_ai.system");
+        var operation = GetNonEmpty(attrs, "gen_ai.operation.name");
+        var model = GetNonEmpty(attrs, "gen_ai.request.model");
+
+        // Tokens: tolerant — integer attribute or string-encoded integer (both converted to string by flattener)
+        var inputTokens = ParseTokens(attrs, "gen_ai.usage.input_tokens");
+        var outputTokens = ParseTokens(attrs, "gen_ai.usage.output_tokens");
+
+        // Agent ID: parse as GUID; raw string survives in RawAttributes regardless (amendment 3)
+        Guid? agentId = null;
+        if (attrs.TryGetValue("gen_ai.agent.id", out var agentIdStr) && !string.IsNullOrEmpty(agentIdStr))
+        {
+            if (Guid.TryParse(agentIdStr, out var guid) && guid != NilGuid && guid != SentinelGuid)
+            {
+                agentId = guid;
+            }
+        }
+
+        var isConformant = provider != null
+            && operation != null
+            && model != null
+            && inputTokens.HasValue
+            && outputTokens.HasValue
+            && agentId.HasValue;
+
+        var startTime = NanosToOffset(span.StartTimeUnixNano);
+        var endTime = span.EndTimeUnixNano > 0 ? NanosToOffset(span.EndTimeUnixNano) : startTime;
+
+        var validated = new ValidatedSpan(
+            TraceId: Convert.ToHexString(span.TraceId.ToByteArray()).ToLowerInvariant(),
+            SpanId: Convert.ToHexString(span.SpanId.ToByteArray()).ToLowerInvariant(),
+            ParentSpanId: span.ParentSpanId.IsEmpty
+                ? null
+                : Convert.ToHexString(span.ParentSpanId.ToByteArray()).ToLowerInvariant(),
+            Name: span.Name,
+            Kind: (int)span.Kind,
+            StartTime: startTime,
+            EndTime: endTime,
+            Operation: operation,
+            Provider: provider,
+            Model: model,
+            InputTokens: inputTokens,
+            OutputTokens: outputTokens,
+            AgentId: agentId,
+            IsConformant: isConformant,
+            RawAttributes: rawAttributes
+        );
+
+        return ValidationResult.Valid(validated);
+    }
+
+    private static string? GetNonEmpty(IReadOnlyDictionary<string, string> attrs, string key) =>
+        attrs.TryGetValue(key, out var value) && !string.IsNullOrEmpty(value) ? value : null;
+
+    private static long? ParseTokens(IReadOnlyDictionary<string, string> attrs, string key)
+    {
+        if (!attrs.TryGetValue(key, out var str) || string.IsNullOrEmpty(str))
+            return null;
+
+        return long.TryParse(str, out var n) && n >= 0 ? n : null;
+    }
+
+    private static DateTimeOffset NanosToOffset(ulong nanos) =>
+        DateTimeOffset.UnixEpoch.AddTicks((long)(nanos / 100));
+}
+
+public sealed record ValidationResult
+{
+    public bool IsEnvelopeValid { get; private init; }
+    public string? EnvelopeError { get; private init; }
+    public ValidatedSpan? Span { get; private init; }
+
+    public static ValidationResult Valid(ValidatedSpan span) =>
+        new() { IsEnvelopeValid = true, Span = span };
+
+    public static ValidationResult EnvelopeInvalid(string error) =>
+        new() { IsEnvelopeValid = false, EnvelopeError = error };
+}
