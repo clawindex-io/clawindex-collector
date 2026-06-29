@@ -18,3 +18,10 @@ This repo is the .NET intake, persistence, and OTLP projection layer. The next p
 
 - Branch off `main` for all work.
 - Never commit to `main` directly.
+
+## Product direction (see docs/strategic-decision-record.md)
+
+- The differentiated product is the durable economics-and-accountability layer (cost attribution, unnecessary-escalation spend, bottleneck accountability, trends). The operational/SRE view is a bring-your-own-viewer on-ramp: operators point their existing Grafana/Aspire at the collector.
+- Do NOT build a custom SRE/span dashboard. Be a standards-correct OTLP backend instead.
+- Ingestion is complete-spans-only. Live open-span watching and real-time "human not responding" alerting are NOT P1 features or claims.
+- OTLP conformance is a first-class requirement: "works with your existing viewer" must actually be true.
