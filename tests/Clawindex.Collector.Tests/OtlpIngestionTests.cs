@@ -289,6 +289,13 @@ public sealed class OtlpFixture : IDisposable
                         ["Clawindex:Projection:Enabled"] = "false"
                     });
                 });
+                builder.ConfigureServices(services =>
+                {
+                    // Override IValidatedSpanSink to InMemorySpanSink for these validation-focused tests
+                    var descriptor = services.Single(d => d.ServiceType == typeof(IValidatedSpanSink));
+                    services.Remove(descriptor);
+                    services.AddSingleton<IValidatedSpanSink>(sp => sp.GetRequiredService<InMemorySpanSink>());
+                });
             });
     }
 
