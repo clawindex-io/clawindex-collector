@@ -87,3 +87,17 @@ The OpenTelemetry GenAI Semantic Conventions are in Development status and mid-t
 - Token and other floor values are read tolerantly with respect to representation (integer or string-encoded integer), since emitters vary.
 
 This tolerance is a transition measure. Prior keys carry a documented sunset and will be dropped once the GenAI conventions stabilize and the installed base has migrated. Until then, accepting both is the honest implementation of the OTel-first promise: an integrator pointing a current OTel stack at ClawIndex should be counted conformant regardless of which convention version their instrumentation defaults to.
+
+## Amendment: Complete-Spans-Only Ingestion
+
+P1 ingestion accepts complete (ended) spans only. A span is in contract when it carries both a start time and an end time.
+
+This aligns with how OpenTelemetry is overwhelmingly emitted in practice: the standard span processor exports a span when it ends, not while it is open. Requiring complete spans is therefore not an unusual constraint — it is declining to support the less common open-span streaming mode.
+
+Rationale and consequence:
+- It removes the most failure-prone machinery from the critical path: there is no live open-span state to store, no restart recovery of in-flight spans, and no start/stop reconciliation. A span arrives whole and is projected whole.
+- It does not reduce product fidelity for the economics-and-accountability layer, which is inherently post-hoc and aggregate. Failed, slow, and churning agents are all visible from completed spans. Stuck episodes are reported after resolution (a timeout error span, or a very-late completion) and, later, via silence-inference against derived baselines. Real-time observation of a span while it hangs is explicitly out of scope for P1 (see docs/strategic-decision-record.md).
+
+Handling of incomplete spans:
+- A span with no end time is envelope-valid (well-formed, not rejected outright) but is flagged INCOMPLETE and is NOT projected into the durable trace/span store.
+- Incomplete spans are not an error condition for the sender; they are simply not yet in contract for projection. This preserves pass-through neutrality (nothing well-formed is discarded) while keeping the durable store to complete spans only.
