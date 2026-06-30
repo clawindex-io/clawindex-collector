@@ -52,7 +52,14 @@ public sealed class SemConvConformanceValidator
             && agentId.HasValue;
 
         var startTime = NanosToOffset(span.StartTimeUnixNano);
-        var endTime = span.EndTimeUnixNano > 0 ? NanosToOffset(span.EndTimeUnixNano) : startTime;
+        var isComplete = span.EndTimeUnixNano > 0;
+        var endTime = isComplete ? NanosToOffset(span.EndTimeUnixNano) : startTime;
+        var otlpStatus = span.Status?.Code switch
+        {
+            OpenTelemetry.Proto.Trace.V1.Status.Types.StatusCode.Ok => "ok",
+            OpenTelemetry.Proto.Trace.V1.Status.Types.StatusCode.Error => "error",
+            _ => "unset"
+        };
 
         var validated = new ValidatedSpan(
             TraceId: Convert.ToHexString(span.TraceId.ToByteArray()).ToLowerInvariant(),
@@ -71,6 +78,8 @@ public sealed class SemConvConformanceValidator
             OutputTokens: outputTokens,
             AgentId: agentId,
             IsConformant: isConformant,
+            IsComplete: isComplete,
+            OtlpStatus: otlpStatus,
             RawAttributes: rawAttributes
         );
 

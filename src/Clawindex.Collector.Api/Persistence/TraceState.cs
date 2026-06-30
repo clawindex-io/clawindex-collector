@@ -2,8 +2,7 @@ namespace Clawindex.Collector.Api.Persistence;
 
 public sealed record TraceState(
     string TraceId,
-    string RootSpanId,
-    string? TaskId,
+    string? RootSpanId,
     string? AgentId,
     string Status,
     DateTimeOffset StartedAt,

@@ -15,5 +15,7 @@ public sealed record ValidatedSpan(
     long? OutputTokens,
     Guid? AgentId,
     bool IsConformant,
+    bool IsComplete,
+    string OtlpStatus,
     IReadOnlyList<KeyValuePair<string, string>> RawAttributes
 );

@@ -6,8 +6,9 @@ public sealed class EventRepository(IConfiguration configuration)
 {
     private const string SelectSpanStateSql =
         """
-        SELECT span_id, trace_id, parent_span_id, task_id, agent_id, span_name, span_kind, status,
-               started_at, ended_at, source_start_event_id, source_end_event_id, attributes_json, updated_at
+        SELECT span_id, trace_id, parent_span_id, agent_id, span_name, span_kind, status,
+               started_at, ended_at, operation, provider, model, input_tokens, output_tokens,
+               is_conformant, attributes_json, updated_at
         FROM span_state
         """;
 
@@ -256,23 +257,21 @@ public sealed class EventRepository(IConfiguration configuration)
         command.CommandText =
             """
             INSERT INTO trace_state (
-              trace_id, root_span_id, task_id, agent_id, status, started_at, ended_at, updated_at
+              trace_id, root_span_id, agent_id, status, started_at, ended_at, updated_at
             )
             VALUES (
-              $trace_id, $root_span_id, $task_id, $agent_id, $status, $started_at, $ended_at, $updated_at
+              $trace_id, $root_span_id, $agent_id, $status, $started_at, $ended_at, $updated_at
             )
             ON CONFLICT(trace_id) DO UPDATE SET
               root_span_id = COALESCE(trace_state.root_span_id, excluded.root_span_id),
-              task_id = COALESCE(trace_state.task_id, excluded.task_id),
               agent_id = COALESCE(trace_state.agent_id, excluded.agent_id),
-              status = CASE WHEN trace_state.status IN ('completed', 'error') THEN trace_state.status ELSE excluded.status END,
+              status = CASE WHEN trace_state.status = 'finalized' THEN 'finalized' ELSE excluded.status END,
               started_at = MIN(trace_state.started_at, excluded.started_at),
-              ended_at = COALESCE(trace_state.ended_at, excluded.ended_at),
+              ended_at = CASE WHEN trace_state.status = 'finalized' THEN trace_state.ended_at ELSE excluded.ended_at END,
               updated_at = excluded.updated_at;
             """;
         command.Parameters.AddWithValue("$trace_id", traceState.TraceId);
-        command.Parameters.AddWithValue("$root_span_id", traceState.RootSpanId);
-        command.Parameters.AddWithValue("$task_id", ToDbValue(traceState.TaskId));
+        command.Parameters.AddWithValue("$root_span_id", ToDbValue(traceState.RootSpanId));
         command.Parameters.AddWithValue("$agent_id", ToDbValue(traceState.AgentId));
         command.Parameters.AddWithValue("$status", traceState.Status);
         command.Parameters.AddWithValue("$started_at", traceState.StartedAt.ToUniversalTime().ToString("O"));
@@ -291,38 +290,40 @@ public sealed class EventRepository(IConfiguration configuration)
         command.CommandText =
             """
             INSERT INTO span_state (
-              span_id, trace_id, parent_span_id, task_id, agent_id, span_name, span_kind, status,
-              started_at, ended_at, source_start_event_id, source_end_event_id, attributes_json, updated_at
+              span_id, trace_id, parent_span_id, agent_id, span_name, span_kind, status,
+              started_at, ended_at, operation, provider, model, input_tokens, output_tokens,
+              is_conformant, attributes_json, updated_at
             )
             VALUES (
-              $span_id, $trace_id, $parent_span_id, $task_id, $agent_id, $span_name, $span_kind, $status,
-              $started_at, $ended_at, $source_start_event_id, $source_end_event_id, $attributes_json, $updated_at
+              $span_id, $trace_id, $parent_span_id, $agent_id, $span_name, $span_kind, $status,
+              $started_at, $ended_at, $operation, $provider, $model, $input_tokens, $output_tokens,
+              $is_conformant, $attributes_json, $updated_at
             )
             ON CONFLICT(span_id) DO UPDATE SET
               trace_id = excluded.trace_id,
-              parent_span_id = COALESCE(span_state.parent_span_id, excluded.parent_span_id),
-              task_id = COALESCE(span_state.task_id, excluded.task_id),
-              agent_id = COALESCE(span_state.agent_id, excluded.agent_id),
+              parent_span_id = excluded.parent_span_id,
+              agent_id = excluded.agent_id,
               span_name = excluded.span_name,
               span_kind = excluded.span_kind,
-              status = CASE WHEN span_state.status IN ('completed', 'error') THEN span_state.status ELSE excluded.status END,
-              started_at = MIN(span_state.started_at, excluded.started_at),
-              source_start_event_id = span_state.source_start_event_id,
+              status = excluded.status,
+              started_at = excluded.started_at,
+              ended_at = excluded.ended_at,
+              operation = excluded.operation,
+              provider = excluded.provider,
+              model = excluded.model,
+              input_tokens = excluded.input_tokens,
+              output_tokens = excluded.output_tokens,
+              is_conformant = excluded.is_conformant,
               attributes_json = excluded.attributes_json,
-              updated_at = excluded.updated_at;
+              updated_at = excluded.updated_at
+            WHERE span_state.status = 'placeholder';
             """;
         AddSpanStateParameters(command, spanState);
 
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public async Task CloseSpanStateAsync(
-        string spanId,
-        string sourceEndEventId,
-        string status,
-        DateTimeOffset endedAt,
-        string attributesJson,
-        CancellationToken cancellationToken = default)
+    public async Task InsertPlaceholderSpanIfAbsentAsync(SpanState placeholder, CancellationToken cancellationToken = default)
     {
         await using var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
@@ -330,20 +331,18 @@ public sealed class EventRepository(IConfiguration configuration)
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            UPDATE span_state
-            SET status = CASE WHEN status IN ('completed', 'error') THEN status ELSE $status END,
-                ended_at = COALESCE(ended_at, $ended_at),
-                source_end_event_id = COALESCE(source_end_event_id, $source_end_event_id),
-                attributes_json = $attributes_json,
-                updated_at = $updated_at
-            WHERE span_id = $span_id;
+            INSERT OR IGNORE INTO span_state (
+              span_id, trace_id, parent_span_id, agent_id, span_name, span_kind, status,
+              started_at, ended_at, operation, provider, model, input_tokens, output_tokens,
+              is_conformant, attributes_json, updated_at
+            )
+            VALUES (
+              $span_id, $trace_id, $parent_span_id, $agent_id, $span_name, $span_kind, $status,
+              $started_at, $ended_at, $operation, $provider, $model, $input_tokens, $output_tokens,
+              $is_conformant, $attributes_json, $updated_at
+            );
             """;
-        command.Parameters.AddWithValue("$span_id", spanId);
-        command.Parameters.AddWithValue("$source_end_event_id", sourceEndEventId);
-        command.Parameters.AddWithValue("$status", status);
-        command.Parameters.AddWithValue("$ended_at", endedAt.ToUniversalTime().ToString("O"));
-        command.Parameters.AddWithValue("$attributes_json", attributesJson);
-        command.Parameters.AddWithValue("$updated_at", DateTimeOffset.UtcNow.ToString("O"));
+        AddSpanStateParameters(command, placeholder);
 
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
@@ -356,7 +355,7 @@ public sealed class EventRepository(IConfiguration configuration)
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            SELECT trace_id, root_span_id, task_id, agent_id, status, started_at, ended_at, updated_at
+            SELECT trace_id, root_span_id, agent_id, status, started_at, ended_at, updated_at
             FROM trace_state
             WHERE trace_id = $trace_id;
             """;
@@ -374,31 +373,6 @@ public sealed class EventRepository(IConfiguration configuration)
         await using var command = connection.CreateCommand();
         command.CommandText = SelectSpanStateSql + " WHERE span_id = $span_id;";
         command.Parameters.AddWithValue("$span_id", spanId);
-
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        return await reader.ReadAsync(cancellationToken) ? ReadSpanState(reader) : null;
-    }
-
-    public async Task<SpanState?> FindBestOpenSpanAsync(
-        string traceId,
-        string? taskId,
-        CancellationToken cancellationToken = default)
-    {
-        await using var connection = new SqliteConnection(_connectionString);
-        await connection.OpenAsync(cancellationToken);
-
-        await using var command = connection.CreateCommand();
-        command.CommandText =
-            SelectSpanStateSql +
-            """
-             WHERE trace_id = $trace_id
-               AND ($task_id IS NULL OR task_id = $task_id)
-               AND status = 'open'
-             ORDER BY CASE WHEN span_kind = 'tool.call' THEN 0 ELSE 1 END, updated_at DESC
-             LIMIT 1;
-            """;
-        command.Parameters.AddWithValue("$trace_id", traceId);
-        command.Parameters.AddWithValue("$task_id", ToDbValue(taskId));
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         return await reader.ReadAsync(cancellationToken) ? ReadSpanState(reader) : null;
@@ -433,7 +407,7 @@ public sealed class EventRepository(IConfiguration configuration)
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            SELECT trace_id, root_span_id, task_id, agent_id, status, started_at, ended_at, updated_at
+            SELECT trace_id, root_span_id, agent_id, status, started_at, ended_at, updated_at
             FROM trace_state
             WHERE status = 'open'
             ORDER BY updated_at;
@@ -592,15 +566,18 @@ public sealed class EventRepository(IConfiguration configuration)
         command.Parameters.AddWithValue("$span_id", spanState.SpanId);
         command.Parameters.AddWithValue("$trace_id", spanState.TraceId);
         command.Parameters.AddWithValue("$parent_span_id", ToDbValue(spanState.ParentSpanId));
-        command.Parameters.AddWithValue("$task_id", ToDbValue(spanState.TaskId));
         command.Parameters.AddWithValue("$agent_id", ToDbValue(spanState.AgentId));
         command.Parameters.AddWithValue("$span_name", spanState.SpanName);
         command.Parameters.AddWithValue("$span_kind", spanState.SpanKind);
         command.Parameters.AddWithValue("$status", spanState.Status);
         command.Parameters.AddWithValue("$started_at", spanState.StartedAt.ToUniversalTime().ToString("O"));
-        command.Parameters.AddWithValue("$ended_at", ToDbValue(spanState.EndedAt?.ToUniversalTime().ToString("O")));
-        command.Parameters.AddWithValue("$source_start_event_id", spanState.SourceStartEventId);
-        command.Parameters.AddWithValue("$source_end_event_id", ToDbValue(spanState.SourceEndEventId));
+        command.Parameters.AddWithValue("$ended_at", spanState.EndedAt.ToUniversalTime().ToString("O"));
+        command.Parameters.AddWithValue("$operation", ToDbValue(spanState.Operation));
+        command.Parameters.AddWithValue("$provider", ToDbValue(spanState.Provider));
+        command.Parameters.AddWithValue("$model", ToDbValue(spanState.Model));
+        command.Parameters.AddWithValue("$input_tokens", spanState.InputTokens.HasValue ? (object)spanState.InputTokens.Value : DBNull.Value);
+        command.Parameters.AddWithValue("$output_tokens", spanState.OutputTokens.HasValue ? (object)spanState.OutputTokens.Value : DBNull.Value);
+        command.Parameters.AddWithValue("$is_conformant", spanState.IsConformant ? 1 : 0);
         command.Parameters.AddWithValue("$attributes_json", spanState.AttributesJson);
         command.Parameters.AddWithValue("$updated_at", spanState.UpdatedAt.ToUniversalTime().ToString("O"));
     }
@@ -637,13 +614,12 @@ public sealed class EventRepository(IConfiguration configuration)
     {
         return new TraceState(
             reader.GetString(0),
-            reader.GetString(1),
+            ReadNullableString(reader, 1),
             ReadNullableString(reader, 2),
-            ReadNullableString(reader, 3),
-            reader.GetString(4),
-            DateTimeOffset.Parse(reader.GetString(5)),
-            ReadNullableDateTimeOffset(reader, 6),
-            DateTimeOffset.Parse(reader.GetString(7)));
+            reader.GetString(3),
+            DateTimeOffset.Parse(reader.GetString(4)),
+            ReadNullableDateTimeOffset(reader, 5),
+            DateTimeOffset.Parse(reader.GetString(6)));
     }
 
     private static SpanState ReadSpanState(SqliteDataReader reader)
@@ -653,16 +629,19 @@ public sealed class EventRepository(IConfiguration configuration)
             reader.GetString(1),
             ReadNullableString(reader, 2),
             ReadNullableString(reader, 3),
-            ReadNullableString(reader, 4),
+            reader.GetString(4),
             reader.GetString(5),
             reader.GetString(6),
-            reader.GetString(7),
+            DateTimeOffset.Parse(reader.GetString(7)),
             DateTimeOffset.Parse(reader.GetString(8)),
-            ReadNullableDateTimeOffset(reader, 9),
-            reader.GetString(10),
+            ReadNullableString(reader, 9),
+            ReadNullableString(reader, 10),
             ReadNullableString(reader, 11),
-            reader.GetString(12),
-            DateTimeOffset.Parse(reader.GetString(13)));
+            reader.IsDBNull(12) ? null : reader.GetInt64(12),
+            reader.IsDBNull(13) ? null : reader.GetInt64(13),
+            reader.GetInt32(14) != 0,
+            reader.GetString(15),
+            DateTimeOffset.Parse(reader.GetString(16)));
     }
 
     private static async Task EnsureProjectionColumnsAsync(SqliteConnection connection)
@@ -719,10 +698,12 @@ public sealed class EventRepository(IConfiguration configuration)
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            CREATE TABLE IF NOT EXISTS trace_state (
+            DROP TABLE IF EXISTS span_state;
+            DROP TABLE IF EXISTS trace_state;
+
+            CREATE TABLE trace_state (
               trace_id TEXT PRIMARY KEY,
-              root_span_id TEXT NOT NULL,
-              task_id TEXT NULL,
+              root_span_id TEXT NULL,
               agent_id TEXT NULL,
               status TEXT NOT NULL,
               started_at TEXT NOT NULL,
@@ -730,25 +711,28 @@ public sealed class EventRepository(IConfiguration configuration)
               updated_at TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS span_state (
+            CREATE TABLE span_state (
               span_id TEXT PRIMARY KEY,
               trace_id TEXT NOT NULL,
               parent_span_id TEXT NULL,
-              task_id TEXT NULL,
               agent_id TEXT NULL,
               span_name TEXT NOT NULL,
               span_kind TEXT NOT NULL,
               status TEXT NOT NULL,
               started_at TEXT NOT NULL,
-              ended_at TEXT NULL,
-              source_start_event_id TEXT NOT NULL,
-              source_end_event_id TEXT NULL,
+              ended_at TEXT NOT NULL,
+              operation TEXT NULL,
+              provider TEXT NULL,
+              model TEXT NULL,
+              input_tokens INTEGER NULL,
+              output_tokens INTEGER NULL,
+              is_conformant INTEGER NOT NULL,
               attributes_json TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_span_state_trace_task_status
-              ON span_state(trace_id, task_id, status);
+            CREATE INDEX idx_span_state_trace_status
+              ON span_state(trace_id, status);
 
             CREATE TABLE IF NOT EXISTS event_span_map (
               event_id TEXT PRIMARY KEY,

@@ -13,13 +13,11 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<EventEnvelopeValidator>();
 builder.Services.AddSingleton<EventRepository>();
-builder.Services.AddSingleton<OtelEventMapper>();
-builder.Services.Configure<OtelProjectionOptions>(builder.Configuration.GetSection("Clawindex:Projection"));
-builder.Services.AddHostedService<OtelProjectionWorker>();
 builder.Services.AddSingleton<SpanFlattener>();
 builder.Services.AddSingleton<SemConvConformanceValidator>();
 builder.Services.AddSingleton<InMemorySpanSink>();
-builder.Services.AddSingleton<IValidatedSpanSink>(sp => sp.GetRequiredService<InMemorySpanSink>());
+builder.Services.AddSingleton<DurableSpanSink>();
+builder.Services.AddSingleton<IValidatedSpanSink>(sp => sp.GetRequiredService<DurableSpanSink>());
 builder.Services.AddOpenApi();
 builder.Services.AddOpenTelemetry()
     .ConfigureResource(resource => resource.AddService(ClawindexTelemetry.ServiceName, serviceVersion: "0.1.0"))
