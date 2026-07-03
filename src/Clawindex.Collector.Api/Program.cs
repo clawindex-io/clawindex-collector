@@ -49,6 +49,46 @@ app.MapGet("/v1/health", () => Results.Ok(new
     version = "0.1.0"
 }));
 
+app.MapGet("/v1/agents", async (
+    string? since,
+    string? until,
+    EventRepository repository,
+    TimeProvider timeProvider,
+    CancellationToken cancellationToken) =>
+{
+    var now = timeProvider.GetUtcNow();
+
+    DateTimeOffset sinceValue;
+    if (since is not null)
+    {
+        if (!DateTimeOffset.TryParse(since, out var parsed))
+            return Results.BadRequest(Rejected("Invalid 'since' parameter: expected ISO-8601 timestamp"));
+        sinceValue = parsed.ToUniversalTime();
+    }
+    else
+    {
+        sinceValue = now.AddDays(-30);
+    }
+
+    DateTimeOffset untilValue;
+    if (until is not null)
+    {
+        if (!DateTimeOffset.TryParse(until, out var parsed))
+            return Results.BadRequest(Rejected("Invalid 'until' parameter: expected ISO-8601 timestamp"));
+        untilValue = parsed.ToUniversalTime();
+    }
+    else
+    {
+        untilValue = now;
+    }
+
+    if (sinceValue >= untilValue)
+        return Results.BadRequest(Rejected("'since' must be before 'until'"));
+
+    var rollups = await repository.GetAgentRollupsAsync(sinceValue, untilValue, cancellationToken);
+    return Results.Ok(rollups);
+});
+
 app.MapGet("/v1/schema", () => Results.Ok(new
 {
     schema_version = "0.1.0",

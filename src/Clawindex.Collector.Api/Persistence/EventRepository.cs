@@ -441,6 +441,58 @@ public sealed class EventRepository(IConfiguration configuration)
         return spans;
     }
 
+    // Invariant: all timestamp columns in span_state are canonical UTC "O" strings
+    // (e.g. "2025-01-01T00:00:00.0000000+00:00"). The window comparison below relies on
+    // lexicographic == chronological ordering, which holds only for same-format UTC strings.
+    // Do not pass non-UTC DateTimeOffset values; callers must normalize to UTC first.
+    // Multi-tenancy addition: prepend WHERE tenant_id = $tenant_id to the existing WHERE
+    // clause — no other change to GROUP BY or SELECT is needed.
+    public async Task<IReadOnlyList<AgentRollup>> GetAgentRollupsAsync(
+        DateTimeOffset since,
+        DateTimeOffset until,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT
+                agent_id,
+                COUNT(*)                                                       AS span_count,
+                COUNT(DISTINCT trace_id)                                       AS trace_count,
+                COUNT(CASE WHEN status = 'error' THEN 1 END)                   AS error_count,
+                COUNT(CASE WHEN status = 'error' THEN 1 END) * 1.0 / COUNT(*) AS error_rate,
+                MAX(ended_at)                                                  AS last_seen,
+                SUM(is_conformant) * 1.0 / COUNT(*)                            AS conformance_ratio
+            FROM span_state
+            WHERE agent_id IS NOT NULL
+              AND ended_at >= $since
+              AND ended_at < $until
+            GROUP BY agent_id
+            ORDER BY last_seen DESC;
+            """;
+        command.Parameters.AddWithValue("$since", since.ToUniversalTime().ToString("O"));
+        command.Parameters.AddWithValue("$until", until.ToUniversalTime().ToString("O"));
+
+        var rollups = new List<AgentRollup>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            rollups.Add(new AgentRollup(
+                AgentId: reader.GetString(0),
+                SpanCount: reader.GetInt64(1),
+                TraceCount: reader.GetInt64(2),
+                ErrorCount: reader.GetInt64(3),
+                ErrorRate: reader.GetDouble(4),
+                LastSeen: DateTimeOffset.Parse(reader.GetString(5)),
+                ConformanceRatio: reader.GetDouble(6)));
+        }
+
+        return rollups;
+    }
+
     public async Task MapEventToSpanAsync(
         string eventId,
         string traceId,
@@ -570,6 +622,8 @@ public sealed class EventRepository(IConfiguration configuration)
         command.Parameters.AddWithValue("$span_name", spanState.SpanName);
         command.Parameters.AddWithValue("$span_kind", spanState.SpanKind);
         command.Parameters.AddWithValue("$status", spanState.Status);
+        // Timestamps must be canonical UTC "O" strings so that lexicographic ordering == chronological ordering.
+        // GetAgentRollupsAsync window comparisons depend on this invariant. Never write non-UTC timestamps.
         command.Parameters.AddWithValue("$started_at", spanState.StartedAt.ToUniversalTime().ToString("O"));
         command.Parameters.AddWithValue("$ended_at", spanState.EndedAt.ToUniversalTime().ToString("O"));
         command.Parameters.AddWithValue("$operation", ToDbValue(spanState.Operation));
