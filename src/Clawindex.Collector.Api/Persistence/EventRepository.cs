@@ -493,6 +493,105 @@ public sealed class EventRepository(IConfiguration configuration)
         return rollups;
     }
 
+    // Multi-tenancy addition: prepend WHERE tenant_id = $tenant_id before agent_id = $agent_id
+    // — no other change to the SELECT or aggregation is needed.
+    public async Task<AgentDetailRollup> GetAgentRollupAsync(
+        string agentId,
+        DateTimeOffset since,
+        DateTimeOffset until,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT
+                COUNT(*)                                                       AS span_count,
+                COUNT(DISTINCT trace_id)                                       AS trace_count,
+                COUNT(CASE WHEN status = 'error' THEN 1 END)                   AS error_count,
+                COUNT(CASE WHEN status = 'error' THEN 1 END) * 1.0 / COUNT(*) AS error_rate,
+                MAX(ended_at)                                                  AS last_seen,
+                SUM(is_conformant) * 1.0 / COUNT(*)                            AS conformance_ratio
+            FROM span_state
+            WHERE agent_id = $agent_id
+              AND agent_id IS NOT NULL
+              AND ended_at >= $since
+              AND ended_at < $until;
+            """;
+        command.Parameters.AddWithValue("$agent_id", agentId);
+        command.Parameters.AddWithValue("$since", since.ToUniversalTime().ToString("O"));
+        command.Parameters.AddWithValue("$until", until.ToUniversalTime().ToString("O"));
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        await reader.ReadAsync(cancellationToken);
+
+        var spanCount = reader.GetInt64(0);
+        var traceCount = reader.GetInt64(1);
+        var errorCount = reader.GetInt64(2);
+        var errorRate = reader.IsDBNull(3) ? 0.0 : reader.GetDouble(3);
+        var lastSeen = reader.IsDBNull(4) ? (DateTimeOffset?)null : DateTimeOffset.Parse(reader.GetString(4));
+        var conformanceRatio = reader.IsDBNull(5) ? 0.0 : reader.GetDouble(5);
+
+        return new AgentDetailRollup(spanCount, traceCount, errorCount, errorRate, lastSeen, conformanceRatio);
+    }
+
+    public async Task<IReadOnlyList<RecentTrace>> GetAgentRecentTracesAsync(
+        string agentId,
+        DateTimeOffset since,
+        DateTimeOffset until,
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT s.trace_id,
+                   COUNT(*)                                      AS span_count,
+                   COUNT(CASE WHEN s.status = 'error' THEN 1 END) AS error_count,
+                   t.status                                      AS trace_status,
+                   t.started_at                                  AS trace_started_at,
+                   t.ended_at                                    AS trace_ended_at
+            FROM span_state s
+            LEFT JOIN trace_state t ON t.trace_id = s.trace_id
+            WHERE s.agent_id = $agent_id AND s.agent_id IS NOT NULL
+              AND s.ended_at >= $since AND s.ended_at < $until
+            GROUP BY s.trace_id, t.status, t.started_at, t.ended_at
+            ORDER BY t.started_at DESC
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$agent_id", agentId);
+        command.Parameters.AddWithValue("$since", since.ToUniversalTime().ToString("O"));
+        command.Parameters.AddWithValue("$until", until.ToUniversalTime().ToString("O"));
+        command.Parameters.AddWithValue("$limit", limit);
+
+        var traces = new List<RecentTrace>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var traceId = reader.GetString(0);
+            var spanCount = reader.GetInt64(1);
+            var errorCount = reader.GetInt64(2);
+            var traceStatus = reader.IsDBNull(3) ? "open" : reader.GetString(3);
+            var startedAt = reader.IsDBNull(4)
+                ? DateTimeOffset.MinValue
+                : DateTimeOffset.Parse(reader.GetString(4));
+            var endedAtStr = reader.IsDBNull(5) ? null : reader.GetString(5);
+            var endedAt = endedAtStr is not null ? DateTimeOffset.Parse(endedAtStr) : (DateTimeOffset?)null;
+            var durationMs = endedAt.HasValue
+                ? (long)(endedAt.Value - startedAt).TotalMilliseconds
+                : (long?)null;
+
+            traces.Add(new RecentTrace(traceId, traceStatus, startedAt, durationMs, spanCount, errorCount));
+        }
+
+        return traces;
+    }
+
     public async Task MapEventToSpanAsync(
         string eventId,
         string traceId,

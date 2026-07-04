@@ -56,37 +56,52 @@ app.MapGet("/v1/agents", async (
     TimeProvider timeProvider,
     CancellationToken cancellationToken) =>
 {
-    var now = timeProvider.GetUtcNow();
-
-    DateTimeOffset sinceValue;
-    if (since is not null)
-    {
-        if (!DateTimeOffset.TryParse(since, out var parsed))
-            return Results.BadRequest(Rejected("Invalid 'since' parameter: expected ISO-8601 timestamp"));
-        sinceValue = parsed.ToUniversalTime();
-    }
-    else
-    {
-        sinceValue = now.AddDays(-30);
-    }
-
-    DateTimeOffset untilValue;
-    if (until is not null)
-    {
-        if (!DateTimeOffset.TryParse(until, out var parsed))
-            return Results.BadRequest(Rejected("Invalid 'until' parameter: expected ISO-8601 timestamp"));
-        untilValue = parsed.ToUniversalTime();
-    }
-    else
-    {
-        untilValue = now;
-    }
-
-    if (sinceValue >= untilValue)
-        return Results.BadRequest(Rejected("'since' must be before 'until'"));
+    var (windowError, sinceValue, untilValue) = ParseWindow(since, until, timeProvider.GetUtcNow());
+    if (windowError is not null) return windowError;
 
     var rollups = await repository.GetAgentRollupsAsync(sinceValue, untilValue, cancellationToken);
     return Results.Ok(rollups);
+});
+
+app.MapGet("/v1/agents/{id}", async (
+    string id,
+    string? since,
+    string? until,
+    string? limit,
+    EventRepository repository,
+    TimeProvider timeProvider,
+    CancellationToken cancellationToken) =>
+{
+    if (!Guid.TryParse(id, out _))
+        return Results.BadRequest(Rejected("'id' must be a valid GUID"));
+
+    var (windowError, sinceValue, untilValue) = ParseWindow(since, until, timeProvider.GetUtcNow());
+    if (windowError is not null) return windowError;
+
+    int limitValue;
+    if (limit is not null)
+    {
+        if (!int.TryParse(limit, out limitValue))
+            return Results.BadRequest(Rejected("Invalid 'limit' parameter: expected a positive integer"));
+        if (limitValue <= 0)
+            return Results.BadRequest(Rejected("Invalid 'limit' parameter: must be greater than 0"));
+        if (limitValue > 200)
+            limitValue = 200;
+    }
+    else
+    {
+        limitValue = 50;
+    }
+
+    var rollup = await repository.GetAgentRollupAsync(id, sinceValue, untilValue, cancellationToken);
+    var recentTraces = await repository.GetAgentRecentTracesAsync(id, sinceValue, untilValue, limitValue, cancellationToken);
+
+    return Results.Ok(new
+    {
+        agent_id = id,
+        rollup,
+        recent_traces = recentTraces
+    });
 });
 
 app.MapGet("/v1/schema", () => Results.Ok(new
@@ -315,5 +330,40 @@ static object Rejected(string message) => new
         message
     }
 };
+
+static (IResult? Error, DateTimeOffset Since, DateTimeOffset Until) ParseWindow(
+    string? since,
+    string? until,
+    DateTimeOffset now)
+{
+    DateTimeOffset sinceValue;
+    if (since is not null)
+    {
+        if (!DateTimeOffset.TryParse(since, out var parsed))
+            return (Results.BadRequest(Rejected("Invalid 'since' parameter: expected ISO-8601 timestamp")), default, default);
+        sinceValue = parsed.ToUniversalTime();
+    }
+    else
+    {
+        sinceValue = now.AddDays(-30);
+    }
+
+    DateTimeOffset untilValue;
+    if (until is not null)
+    {
+        if (!DateTimeOffset.TryParse(until, out var parsed))
+            return (Results.BadRequest(Rejected("Invalid 'until' parameter: expected ISO-8601 timestamp")), default, default);
+        untilValue = parsed.ToUniversalTime();
+    }
+    else
+    {
+        untilValue = now;
+    }
+
+    if (sinceValue >= untilValue)
+        return (Results.BadRequest(Rejected("'since' must be before 'until'")), default, default);
+
+    return (null, sinceValue, untilValue);
+}
 
 public partial class Program;
