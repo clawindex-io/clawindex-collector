@@ -574,19 +574,19 @@ public sealed class EventRepository(IConfiguration configuration)
         while (await reader.ReadAsync(cancellationToken))
         {
             var traceId = reader.GetString(0);
-            var spanCount = reader.GetInt64(1);
+            var agentSpanCount = reader.GetInt64(1);
             var errorCount = reader.GetInt64(2);
             var traceStatus = reader.IsDBNull(3) ? "open" : reader.GetString(3);
             var startedAt = reader.IsDBNull(4)
-                ? DateTimeOffset.MinValue
+                ? (DateTimeOffset?)null
                 : DateTimeOffset.Parse(reader.GetString(4));
             var endedAtStr = reader.IsDBNull(5) ? null : reader.GetString(5);
             var endedAt = endedAtStr is not null ? DateTimeOffset.Parse(endedAtStr) : (DateTimeOffset?)null;
-            var durationMs = endedAt.HasValue
-                ? (long)(endedAt.Value - startedAt).TotalMilliseconds
+            var durationMs = startedAt.HasValue && endedAt.HasValue
+                ? (long)(endedAt.Value - startedAt.Value).TotalMilliseconds
                 : (long?)null;
 
-            traces.Add(new RecentTrace(traceId, traceStatus, startedAt, durationMs, spanCount, errorCount));
+            traces.Add(new RecentTrace(traceId, traceStatus, startedAt, durationMs, agentSpanCount, errorCount));
         }
 
         return traces;
