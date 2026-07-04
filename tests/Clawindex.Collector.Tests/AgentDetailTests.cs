@@ -259,9 +259,9 @@ public sealed class AgentDetailTests
         var errored = traces.Single(t => t.TraceId == "error-trace");
 
         Assert.Equal(0, clean.ErrorCount);
-        Assert.Equal(2, clean.SpanCount);
+        Assert.Equal(2, clean.AgentSpanCount);
         Assert.Equal(1, errored.ErrorCount);
-        Assert.Equal(2, errored.SpanCount);
+        Assert.Equal(2, errored.AgentSpanCount);
     }
 
     [Fact]
@@ -362,7 +362,7 @@ public sealed class AgentDetailTests
 
         var trace = Assert.Single(traces);
         Assert.Equal(10 * 60 * 1000L, trace.DurationMs);   // full 10-min duration from trace_state
-        Assert.Equal(traceStart, trace.StartedAt);
+        Assert.Equal((DateTimeOffset?)traceStart, trace.StartedAt);
     }
 
     [Fact]
