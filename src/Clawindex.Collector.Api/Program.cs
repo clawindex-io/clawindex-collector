@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Clawindex.Collector.Api;
+using Clawindex.Collector.Api.Economics;
 using Clawindex.Collector.Api.Otlp;
 using Clawindex.Collector.Api.Persistence;
 using Clawindex.Collector.Api.Projection;
@@ -13,6 +14,14 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<EventEnvelopeValidator>();
 builder.Services.AddSingleton<EventRepository>();
+builder.Services.AddSingleton(_ =>
+{
+    var assembly = typeof(PricingTable).Assembly;
+    using var stream = assembly.GetManifestResourceStream("Clawindex.Collector.Api.Economics.pricing.json")
+        ?? throw new InvalidOperationException("Embedded resource pricing.json not found.");
+    return new PricingTable(stream);
+});
+builder.Services.AddSingleton<CostEstimator>();
 builder.Services.AddSingleton<SpanFlattener>();
 builder.Services.AddSingleton<SemConvConformanceValidator>();
 builder.Services.AddSingleton<InMemorySpanSink>();
@@ -52,15 +61,43 @@ app.MapGet("/v1/health", () => Results.Ok(new
 app.MapGet("/v1/agents", async (
     string? since,
     string? until,
+    string? sort,
     EventRepository repository,
+    CostEstimator costEstimator,
     TimeProvider timeProvider,
     CancellationToken cancellationToken) =>
 {
     var (windowError, sinceValue, untilValue) = ParseWindow(since, until, timeProvider.GetUtcNow());
     if (windowError is not null) return windowError;
 
-    var rollups = await repository.GetAgentRollupsAsync(sinceValue, untilValue, cancellationToken);
-    return Results.Ok(rollups);
+    var rollups         = await repository.GetAgentRollupsAsync(sinceValue, untilValue, cancellationToken);
+    var tokenAggregates = await repository.GetAgentTokenAggregatesAsync(sinceValue, untilValue, cancellationToken);
+
+    var costByAgent = tokenAggregates
+        .GroupBy(a => a.AgentId)
+        .ToDictionary(g => g.Key, g => g.ToList());
+
+    var enriched = rollups.Select(r =>
+    {
+        var groups = costByAgent.TryGetValue(r.AgentId, out var g) ? g : [];
+        var cost = costEstimator.EstimateAgent(groups, r.SpanCount, untilValue);
+        return r with
+        {
+            EstimatedCostUsd           = cost.EstimatedCostUsd,
+            EstimatedErrorTraceCostUsd = cost.EstimatedErrorTraceCostUsd,
+            CostedSpanCount            = cost.CostedSpanCount,
+            UncostedSpanCount          = cost.UncostedSpanCount,
+            CostCoverage               = cost.CostCoverage,
+            PricedAsOf                 = cost.PricedAsOf,
+            PricingStale               = cost.PricingStale
+        };
+    });
+
+    var ordered = sort?.ToLowerInvariant() == "estimated_cost_desc"
+        ? enriched.OrderByDescending(r => r.EstimatedCostUsd ?? decimal.MinValue)
+        : enriched;
+
+    return Results.Ok(ordered);
 });
 
 app.MapGet("/v1/agents/{id}", async (
@@ -69,6 +106,7 @@ app.MapGet("/v1/agents/{id}", async (
     string? until,
     string? limit,
     EventRepository repository,
+    CostEstimator costEstimator,
     TimeProvider timeProvider,
     CancellationToken cancellationToken) =>
 {
@@ -93,14 +131,40 @@ app.MapGet("/v1/agents/{id}", async (
         limitValue = 50;
     }
 
-    var rollup = await repository.GetAgentRollupAsync(id, sinceValue, untilValue, cancellationToken);
-    var recentTraces = await repository.GetAgentRecentTracesAsync(id, sinceValue, untilValue, limitValue, cancellationToken);
+    var rollup              = await repository.GetAgentRollupAsync(id, sinceValue, untilValue, cancellationToken);
+    var agentTokenAggregates = await repository.GetSingleAgentTokenAggregatesAsync(id, sinceValue, untilValue, cancellationToken);
+    var agentCost           = costEstimator.EstimateAgent(agentTokenAggregates, rollup.SpanCount, untilValue);
+
+    var enrichedRollup = rollup with
+    {
+        EstimatedCostUsd           = agentCost.EstimatedCostUsd,
+        EstimatedErrorTraceCostUsd = agentCost.EstimatedErrorTraceCostUsd,
+        CostedSpanCount            = agentCost.CostedSpanCount,
+        UncostedSpanCount          = agentCost.UncostedSpanCount,
+        CostCoverage               = agentCost.CostCoverage,
+        PricedAsOf                 = agentCost.PricedAsOf,
+        PricingStale               = agentCost.PricingStale
+    };
+
+    var recentTraces        = await repository.GetAgentRecentTracesAsync(id, sinceValue, untilValue, limitValue, cancellationToken);
+    var traceTokenAggregates = await repository.GetAgentTraceTokenAggregatesAsync(id, sinceValue, untilValue, cancellationToken);
+
+    var traceAggregatesByTraceId = traceTokenAggregates
+        .GroupBy(a => a.TraceId)
+        .ToDictionary(g => g.Key, g => g.ToList());
+
+    var enrichedTraces = recentTraces.Select(t =>
+    {
+        var groups = traceAggregatesByTraceId.TryGetValue(t.TraceId, out var g) ? g : [];
+        var cost = costEstimator.EstimateTrace(groups, t.AgentSpanCount, untilValue);
+        return t with { EstimatedCostUsd = cost.EstimatedCostUsd, CostCoverage = cost.CostCoverage };
+    }).ToList();
 
     return Results.Ok(new
     {
         agent_id = id,
-        rollup,
-        recent_traces = recentTraces
+        rollup = enrichedRollup,
+        recent_traces = enrichedTraces
     });
 });
 
