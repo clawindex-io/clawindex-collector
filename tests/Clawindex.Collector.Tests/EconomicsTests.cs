@@ -2,6 +2,7 @@ using System.Net;
 using System.Text.Json;
 using Clawindex.Collector.Api.Economics;
 using Clawindex.Collector.Api.Persistence;
+using Microsoft.Extensions.Configuration;
 
 namespace Clawindex.Collector.Tests;
 
@@ -456,7 +457,7 @@ public sealed class EconomicsIntegrationTests
             new DateTimeOffset(2026, 3, 1, 0, 0, 0, TimeSpan.Zero),
             new DateTimeOffset(2026, 4, 1, 0, 0, 0, TimeSpan.Zero));
 
-        var agg = Assert.Single(aggregates.Where(a => a.AgentId == agent));
+        var agg = Assert.Single(aggregates, a => a.AgentId == agent);
         Assert.Equal(1500, agg.InputTokens);
         Assert.Equal(600,  agg.OutputTokens);
         Assert.Equal(2,    agg.TokenBearingSpanCount);
@@ -482,7 +483,7 @@ public sealed class EconomicsIntegrationTests
             new DateTimeOffset(2026, 4, 1, 0, 0, 0, TimeSpan.Zero),
             new DateTimeOffset(2026, 5, 1, 0, 0, 0, TimeSpan.Zero));
 
-        var agg = Assert.Single(aggregates.Where(a => a.AgentId == agent));
+        var agg = Assert.Single(aggregates, a => a.AgentId == agent);
         Assert.Equal(2, agg.SpanCount);
         Assert.Equal(1, agg.TokenBearingSpanCount);
     }
@@ -510,7 +511,7 @@ public sealed class EconomicsIntegrationTests
             new DateTimeOffset(2026, 5, 1, 0, 0, 0, TimeSpan.Zero),
             new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero));
 
-        var agg = Assert.Single(aggregates.Where(a => a.AgentId == agent));
+        var agg = Assert.Single(aggregates, a => a.AgentId == agent);
         Assert.Equal(800, agg.InputTokens);   // 200+100+500
         Assert.Equal(320, agg.OutputTokens);  // 80+40+200
         Assert.Equal(300, agg.ErrorTraceInputTokens);  // 200+100 (both spans in error trace)
@@ -876,7 +877,7 @@ public sealed class EconomicsIntegrationTests
         public RepositoryFixture()
         {
             _dbPath = Path.Combine(Path.GetTempPath(), $"clawindex-econ-test-{Guid.NewGuid():N}.db");
-            var config = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            var config = new ConfigurationBuilder()
                 .AddInMemoryCollection(new Dictionary<string, string?> { ["Clawindex:DatabasePath"] = _dbPath })
                 .Build();
             Repository = new EventRepository(config);
