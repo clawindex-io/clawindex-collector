@@ -1,3 +1,4 @@
+using Clawindex.Collector.Api.Economics;
 using Microsoft.Data.Sqlite;
 
 namespace Clawindex.Collector.Api.Persistence;
@@ -672,6 +673,170 @@ public sealed class EventRepository(IConfiguration configuration)
         }
 
         return events;
+    }
+
+    // Returns one row per (agent_id, provider, model) across the window, with token totals
+    // split by all spans vs spans that belong to traces with at least one error span.
+    // Cost is computed at read time from these aggregates; nothing is written back to span_state.
+    // Multi-tenancy addition: prepend WHERE s.agent_id IS NOT NULL AND tenant_id = $tenant_id.
+    public async Task<IReadOnlyList<AgentTokenAggregate>> GetAgentTokenAggregatesAsync(
+        DateTimeOffset since,
+        DateTimeOffset until,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT
+                s.agent_id,
+                s.provider,
+                s.model,
+                SUM(COALESCE(s.input_tokens,  0))                                                     AS input_tokens,
+                SUM(COALESCE(s.output_tokens, 0))                                                     AS output_tokens,
+                COUNT(*)                                                                               AS span_count,
+                COUNT(CASE WHEN s.input_tokens IS NOT NULL THEN 1 END)                                AS token_bearing_span_count,
+                SUM(CASE WHEN err.trace_id IS NOT NULL THEN COALESCE(s.input_tokens,  0) ELSE 0 END)  AS error_trace_input_tokens,
+                SUM(CASE WHEN err.trace_id IS NOT NULL THEN COALESCE(s.output_tokens, 0) ELSE 0 END)  AS error_trace_output_tokens,
+                COUNT(CASE WHEN err.trace_id IS NOT NULL AND s.input_tokens IS NOT NULL THEN 1 END)   AS error_trace_token_bearing_spans
+            FROM span_state s
+            LEFT JOIN (
+                SELECT DISTINCT trace_id
+                FROM span_state
+                WHERE agent_id IS NOT NULL
+                  AND status = 'error'
+                  AND ended_at >= $since AND ended_at < $until
+            ) err ON err.trace_id = s.trace_id
+            WHERE s.agent_id IS NOT NULL
+              AND s.ended_at >= $since AND s.ended_at < $until
+            GROUP BY s.agent_id, s.provider, s.model;
+            """;
+        command.Parameters.AddWithValue("$since", since.ToUniversalTime().ToString("O"));
+        command.Parameters.AddWithValue("$until", until.ToUniversalTime().ToString("O"));
+
+        var results = new List<AgentTokenAggregate>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(new AgentTokenAggregate(
+                AgentId:                         reader.GetString(0),
+                Provider:                        ReadNullableString(reader, 1),
+                Model:                           ReadNullableString(reader, 2),
+                InputTokens:                     reader.GetInt64(3),
+                OutputTokens:                    reader.GetInt64(4),
+                SpanCount:                       reader.GetInt64(5),
+                TokenBearingSpanCount:           reader.GetInt64(6),
+                ErrorTraceInputTokens:           reader.GetInt64(7),
+                ErrorTraceOutputTokens:          reader.GetInt64(8),
+                ErrorTraceTokenBearingSpanCount: reader.GetInt64(9)));
+        }
+
+        return results;
+    }
+
+    public async Task<IReadOnlyList<AgentTokenAggregate>> GetSingleAgentTokenAggregatesAsync(
+        string agentId,
+        DateTimeOffset since,
+        DateTimeOffset until,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT
+                s.agent_id,
+                s.provider,
+                s.model,
+                SUM(COALESCE(s.input_tokens,  0))                                                     AS input_tokens,
+                SUM(COALESCE(s.output_tokens, 0))                                                     AS output_tokens,
+                COUNT(*)                                                                               AS span_count,
+                COUNT(CASE WHEN s.input_tokens IS NOT NULL THEN 1 END)                                AS token_bearing_span_count,
+                SUM(CASE WHEN err.trace_id IS NOT NULL THEN COALESCE(s.input_tokens,  0) ELSE 0 END)  AS error_trace_input_tokens,
+                SUM(CASE WHEN err.trace_id IS NOT NULL THEN COALESCE(s.output_tokens, 0) ELSE 0 END)  AS error_trace_output_tokens,
+                COUNT(CASE WHEN err.trace_id IS NOT NULL AND s.input_tokens IS NOT NULL THEN 1 END)   AS error_trace_token_bearing_spans
+            FROM span_state s
+            LEFT JOIN (
+                SELECT DISTINCT trace_id
+                FROM span_state
+                WHERE agent_id = $agent_id AND agent_id IS NOT NULL
+                  AND status = 'error'
+                  AND ended_at >= $since AND ended_at < $until
+            ) err ON err.trace_id = s.trace_id
+            WHERE s.agent_id = $agent_id AND s.agent_id IS NOT NULL
+              AND s.ended_at >= $since AND s.ended_at < $until
+            GROUP BY s.agent_id, s.provider, s.model;
+            """;
+        command.Parameters.AddWithValue("$agent_id", agentId);
+        command.Parameters.AddWithValue("$since", since.ToUniversalTime().ToString("O"));
+        command.Parameters.AddWithValue("$until", until.ToUniversalTime().ToString("O"));
+
+        var results = new List<AgentTokenAggregate>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(new AgentTokenAggregate(
+                AgentId:                         reader.GetString(0),
+                Provider:                        ReadNullableString(reader, 1),
+                Model:                           ReadNullableString(reader, 2),
+                InputTokens:                     reader.GetInt64(3),
+                OutputTokens:                    reader.GetInt64(4),
+                SpanCount:                       reader.GetInt64(5),
+                TokenBearingSpanCount:           reader.GetInt64(6),
+                ErrorTraceInputTokens:           reader.GetInt64(7),
+                ErrorTraceOutputTokens:          reader.GetInt64(8),
+                ErrorTraceTokenBearingSpanCount: reader.GetInt64(9)));
+        }
+
+        return results;
+    }
+
+    public async Task<IReadOnlyList<TraceTokenAggregate>> GetAgentTraceTokenAggregatesAsync(
+        string agentId,
+        DateTimeOffset since,
+        DateTimeOffset until,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT
+                trace_id,
+                provider,
+                model,
+                SUM(COALESCE(input_tokens,  0))                       AS input_tokens,
+                SUM(COALESCE(output_tokens, 0))                       AS output_tokens,
+                COUNT(CASE WHEN input_tokens IS NOT NULL THEN 1 END)  AS token_bearing_span_count
+            FROM span_state
+            WHERE agent_id = $agent_id AND agent_id IS NOT NULL
+              AND ended_at >= $since AND ended_at < $until
+            GROUP BY trace_id, provider, model;
+            """;
+        command.Parameters.AddWithValue("$agent_id", agentId);
+        command.Parameters.AddWithValue("$since", since.ToUniversalTime().ToString("O"));
+        command.Parameters.AddWithValue("$until", until.ToUniversalTime().ToString("O"));
+
+        var results = new List<TraceTokenAggregate>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(new TraceTokenAggregate(
+                TraceId:               reader.GetString(0),
+                Provider:              ReadNullableString(reader, 1),
+                Model:                 ReadNullableString(reader, 2),
+                InputTokens:           reader.GetInt64(3),
+                OutputTokens:          reader.GetInt64(4),
+                TokenBearingSpanCount: reader.GetInt64(5)));
+        }
+
+        return results;
     }
 
     private static SqliteCommand CreateInsertCommand(SqliteConnection connection, AcceptedEvent acceptedEvent)

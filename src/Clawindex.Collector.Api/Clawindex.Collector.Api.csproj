@@ -19,4 +19,8 @@
     <Protobuf Include="Protos/**/*.proto" GrpcServices="None" ProtoRoot="Protos" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="Economics\pricing.json" />
+  </ItemGroup>
+
 </Project>
