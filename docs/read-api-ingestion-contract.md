@@ -47,26 +47,34 @@ A span is conformance-complete when it carries all of the following, each satisf
 | Model | `gen_ai.request.model` | Required, non-empty string |
 | Input tokens | `gen_ai.usage.input_tokens` | Required, non-negative integer |
 | Output tokens | `gen_ai.usage.output_tokens` | Required, non-negative integer |
-| Agent identity | `gen_ai.agent.id` | Required, valid GUID; must not be the nil GUID (`00000000-0000-0000-0000-000000000000`) or the `00000000-0000-0000-0000-000000000001` sentinel |
+| Agent identity | `clawindex.agent.id` | Required; non-empty string ≥ 8 chars (after trim); not a placeholder (denylist, case-insensitive: "agent", "test", "null", "none", "unknown", "id", "default", nil GUID string, `00000000-0000-0000-0000-000000000001` sentinel). A GUID is a valid value; GUID format is not required. |
 
 ### Agent identity requirements
 
-Agent identity is a ClawIndex conformance requirement, not an optional SemConv attribute. The product is agent-centric; stable agent identity is the spine of every view.
+The conformance floor is the GenAI SemConv floor (operation, provider, model, input tokens, output tokens) **plus one ClawIndex-required field: `clawindex.agent.id`**. This field is not a SemConv attribute — generic OTLP viewers will treat it as an ordinary custom attribute, which is expected and correct.
 
-- The value must be a valid GUID, carried in `gen_ai.agent.id`.
-- The nil GUID and the `...0001` sentinel are rejected as conformant values; they indicate a placeholder or gaming attempt.
-- The integrator generates one stable GUID per logical agent and persists it in their configuration. It is expected to remain stable for the agent's lifetime.
-- The agent GUID is an **identifier, not a secret**. It appears in telemetry, the read API, and the dashboard. It must not be treated as a credential.
+`clawindex.agent.id` must be:
+- Present and non-empty after trimming whitespace.
+- At least 8 characters long.
+- Not a placeholder value. Rejected values (case-insensitive): `"agent"`, `"test"`, `"null"`, `"none"`, `"unknown"`, `"id"`, `"default"`, the all-zero GUID (`00000000-0000-0000-0000-000000000000`), and the `00000000-0000-0000-0000-000000000001` sentinel.
+
+A GUID is a perfectly valid value for `clawindex.agent.id`. GUID format is not required — integrators may use any stable identifier scheme (service name + deployment slot, their own UUID scheme, etc.).
+
+**Integrator contract:** `clawindex.agent.id` must be stable for the lifetime of a logical agent and unique across your agents. Reusing or rotating it will corrupt your rollups — spans from two different agents will be merged under a single identity, and historical data for that id becomes unreliable. Stability and uniqueness are the integrator's documented responsibility; the collector only refuses obviously-broken values.
+
+**Recommendation:** Use a GUID or other high-entropy identifier. Human-readable names (e.g. `"support-bot"`, `"agent001"`) risk collision: if two deployments or two operators happen to use the same name, their data silently merges. A GUID eliminates that risk without requiring any naming convention.
+
+`clawindex.agent.id` is an identifier, not a secret. It appears in telemetry, the read API, and any viewer pointed at the collector. Do not treat it as a credential.
 
 ## Anti-Gaming Posture
 
 Conformance is surfaced, not hidden. The collector tracks a **per-agent conformance ratio** (conformance-complete spans / total spans for that agent). This ratio is a first-class signal in the agent view, so an integrator who emits SemConv spans without the useful floor fields sees their own instrumentation quality reflected back, rather than silently passing as integrated.
 
-Gaming the integration (placeholder GUIDs, missing token counts, stub attributes) becomes visible in the dashboard instead of producing empty or misleading agent statistics.
+Gaming the integration (placeholder or denylist agent-ids, missing token counts, stub attributes) becomes visible in the dashboard instead of producing empty or misleading agent statistics.
 
 ## Known Limitations
 
-- The collector cannot enforce **GUID stability** across runs from its side; it can only document the expectation and, in a later slice, surface anomalies (e.g. a GUID seen once and never again).
+- The collector cannot enforce **agent-id stability** across runs from its side; it can only document the expectation and, in a later slice, surface anomalies (e.g. an agent-id seen once and never again).
 - Token counts are taken as reported by the integrator. The collector does not independently verify them against provider billing.
 - This contract defines ingestion and the conformance floor only. The persistence schema changes (first-class projected fields, conformance flag) and the agent-first read API are separate, dependent issues.
 

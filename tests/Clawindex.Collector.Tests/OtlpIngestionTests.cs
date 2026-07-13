@@ -18,7 +18,7 @@ public sealed class OtlpIngestionTests
     public async Task OtlpIngestion_ConformantSpan_Returns200_AndIsConformantInSink()
     {
         using var fixture = new OtlpFixture();
-        var agentId = Guid.NewGuid();
+        const string agentId = "svc-chat-prod-v1";
 
         using var response = await fixture.PostOtlpAsync(BuildConformantRequest(agentId));
 
@@ -39,7 +39,7 @@ public sealed class OtlpIngestionTests
     {
         using var fixture = new OtlpFixture();
 
-        var request = BuildConformantRequest(Guid.NewGuid());
+        var request = BuildConformantRequest();
         // Remove token attributes from the span
         var span = request.ResourceSpans[0].ScopeSpans[0].Spans[0];
         var attrs = span.Attributes.Where(a =>
@@ -58,11 +58,12 @@ public sealed class OtlpIngestionTests
     }
 
     [Fact]
-    public async Task OtlpIngestion_NilGuidAgentId_MarkedNonConformant()
+    public async Task OtlpIngestion_ClawindexAgentId_NilGuidString_MarkedNonConformant()
     {
         using var fixture = new OtlpFixture();
+        const string nilGuid = "00000000-0000-0000-0000-000000000000";
 
-        var request = BuildConformantRequest(Guid.Empty);
+        var request = BuildConformantRequest(nilGuid);
 
         using var response = await fixture.PostOtlpAsync(request);
 
@@ -71,18 +72,18 @@ public sealed class OtlpIngestionTests
         Assert.Single(received);
         Assert.False(received[0].IsConformant);
         Assert.Null(received[0].AgentId);
-        // Raw attribute string must still be present (amendment 3)
+        // Raw attribute must survive (amendment 3)
         Assert.Contains(received[0].RawAttributes,
-            kv => kv.Key == "gen_ai.agent.id" && kv.Value == Guid.Empty.ToString());
+            kv => kv.Key == "clawindex.agent.id" && kv.Value == nilGuid);
     }
 
     [Fact]
-    public async Task OtlpIngestion_SentinelGuidAgentId_MarkedNonConformant()
+    public async Task OtlpIngestion_ClawindexAgentId_SentinelGuidString_MarkedNonConformant()
     {
         using var fixture = new OtlpFixture();
-        var sentinel = new Guid("00000000-0000-0000-0000-000000000001");
+        const string sentinelGuid = "00000000-0000-0000-0000-000000000001";
 
-        var request = BuildConformantRequest(sentinel);
+        var request = BuildConformantRequest(sentinelGuid);
 
         using var response = await fixture.PostOtlpAsync(request);
 
@@ -92,18 +93,15 @@ public sealed class OtlpIngestionTests
         Assert.False(received[0].IsConformant);
         Assert.Null(received[0].AgentId);
         Assert.Contains(received[0].RawAttributes,
-            kv => kv.Key == "gen_ai.agent.id" && kv.Value == sentinel.ToString());
+            kv => kv.Key == "clawindex.agent.id" && kv.Value == sentinelGuid);
     }
 
     [Fact]
-    public async Task OtlpIngestion_MalformedAgentId_MarkedNonConformant()
+    public async Task OtlpIngestion_ClawindexAgentId_DenylistWord_MarkedNonConformant()
     {
         using var fixture = new OtlpFixture();
 
-        var request = BuildConformantRequest(Guid.NewGuid());
-        var span = request.ResourceSpans[0].ScopeSpans[0].Spans[0];
-        var agentAttr = span.Attributes.First(a => a.Key == "gen_ai.agent.id");
-        agentAttr.Value = new AnyValue { StringValue = "not-a-guid" };
+        var request = BuildConformantRequest("unknown");
 
         using var response = await fixture.PostOtlpAsync(request);
 
@@ -112,9 +110,76 @@ public sealed class OtlpIngestionTests
         Assert.Single(received);
         Assert.False(received[0].IsConformant);
         Assert.Null(received[0].AgentId);
-        // Raw bad value must survive (amendment 3)
         Assert.Contains(received[0].RawAttributes,
-            kv => kv.Key == "gen_ai.agent.id" && kv.Value == "not-a-guid");
+            kv => kv.Key == "clawindex.agent.id" && kv.Value == "unknown");
+    }
+
+    [Fact]
+    public async Task OtlpIngestion_ClawindexAgentId_TooShort_MarkedNonConformant()
+    {
+        using var fixture = new OtlpFixture();
+
+        var request = BuildConformantRequest("abc");
+
+        using var response = await fixture.PostOtlpAsync(request);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var received = fixture.SpanSink.Received;
+        Assert.Single(received);
+        Assert.False(received[0].IsConformant);
+        Assert.Null(received[0].AgentId);
+    }
+
+    [Fact]
+    public async Task OtlpIngestion_ClawindexAgentId_EmptyOrWhitespace_MarkedNonConformant()
+    {
+        using var fixture = new OtlpFixture();
+
+        foreach (var badValue in new[] { "", "   " })
+        {
+            var request = BuildConformantRequest(badValue);
+            using var response = await fixture.PostOtlpAsync(request);
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var received = fixture.SpanSink.Received;
+            Assert.Single(received);
+            Assert.False(received[0].IsConformant);
+            Assert.Null(received[0].AgentId);
+            fixture.SpanSink.Clear();
+        }
+    }
+
+    [Fact]
+    public async Task OtlpIngestion_ClawindexAgentId_NonGuidString_MarkedConformant()
+    {
+        using var fixture = new OtlpFixture();
+
+        var request = BuildConformantRequest("svc-support-bot-prod");
+
+        using var response = await fixture.PostOtlpAsync(request);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var received = fixture.SpanSink.Received;
+        Assert.Single(received);
+        Assert.True(received[0].IsConformant);
+        Assert.Equal("svc-support-bot-prod", received[0].AgentId);
+    }
+
+    [Fact]
+    public async Task OtlpIngestion_ClawindexAgentId_ValidGuidString_StillConformant()
+    {
+        using var fixture = new OtlpFixture();
+        var guid = Guid.NewGuid().ToString();
+
+        var request = BuildConformantRequest(guid);
+
+        using var response = await fixture.PostOtlpAsync(request);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var received = fixture.SpanSink.Received;
+        Assert.Single(received);
+        Assert.True(received[0].IsConformant);
+        Assert.Equal(guid, received[0].AgentId);
     }
 
     [Fact]
@@ -149,7 +214,7 @@ public sealed class OtlpIngestionTests
     public async Task OtlpIngestion_MultipleSpans_MixedConformance_AllAccepted()
     {
         using var fixture = new OtlpFixture();
-        var goodAgent = Guid.NewGuid();
+        const string goodAgent = "svc-chat-prod-v1";
 
         var request = new ExportTraceServiceRequest();
         var resource = new Resource();
@@ -159,11 +224,11 @@ public sealed class OtlpIngestionTests
         request.ResourceSpans.Add(resourceSpans);
 
         // Span 1: conformant
-        scopeSpans.Spans.Add(MakeSpan(goodAgent.ToString(), includeTokens: true));
+        scopeSpans.Spans.Add(MakeSpan(goodAgent, includeTokens: true));
         // Span 2: missing agent id → non-conformant
         scopeSpans.Spans.Add(MakeSpan(agentId: null, includeTokens: true));
         // Span 3: missing tokens → non-conformant
-        scopeSpans.Spans.Add(MakeSpan(goodAgent.ToString(), includeTokens: false));
+        scopeSpans.Spans.Add(MakeSpan(goodAgent, includeTokens: false));
 
         using var response = await fixture.PostOtlpAsync(request);
 
@@ -178,10 +243,9 @@ public sealed class OtlpIngestionTests
     public async Task OtlpIngestion_ProviderViaGenAiSystem_IsConformant()
     {
         using var fixture = new OtlpFixture();
-        var agentId = Guid.NewGuid();
 
         // Use gen_ai.system (prior key) instead of gen_ai.provider.name (current key)
-        var request = BuildConformantRequest(agentId, providerKey: "gen_ai.system");
+        var request = BuildConformantRequest(providerKey: "gen_ai.system");
 
         using var response = await fixture.PostOtlpAsync(request);
 
@@ -196,10 +260,9 @@ public sealed class OtlpIngestionTests
     public async Task OtlpIngestion_StringEncodedTokens_IsConformant()
     {
         using var fixture = new OtlpFixture();
-        var agentId = Guid.NewGuid();
 
         // Tokens as string-encoded integers (tolerance from SemConv amendment)
-        var request = BuildConformantRequest(agentId, tokensAsString: true);
+        var request = BuildConformantRequest(tokensAsString: true);
 
         using var response = await fixture.PostOtlpAsync(request);
 
@@ -214,7 +277,7 @@ public sealed class OtlpIngestionTests
     // --- Helpers ---
 
     private static ExportTraceServiceRequest BuildConformantRequest(
-        Guid agentId,
+        string agentId = "svc-default-agent",
         string providerKey = "gen_ai.provider.name",
         bool tokensAsString = false)
     {
@@ -222,7 +285,7 @@ public sealed class OtlpIngestionTests
         var resource = new Resource();
         var resourceSpans = new ResourceSpans { Resource = resource };
         var scopeSpans = new ScopeSpans();
-        scopeSpans.Spans.Add(MakeSpan(agentId.ToString(), includeTokens: true, providerKey: providerKey, tokensAsString: tokensAsString));
+        scopeSpans.Spans.Add(MakeSpan(agentId, includeTokens: true, providerKey: providerKey, tokensAsString: tokensAsString));
         resourceSpans.ScopeSpans.Add(scopeSpans);
         request.ResourceSpans.Add(resourceSpans);
         return request;
@@ -265,7 +328,7 @@ public sealed class OtlpIngestionTests
 
         if (agentId != null)
         {
-            span.Attributes.Add(new KeyValue { Key = "gen_ai.agent.id", Value = new AnyValue { StringValue = agentId } });
+            span.Attributes.Add(new KeyValue { Key = "clawindex.agent.id", Value = new AnyValue { StringValue = agentId } });
         }
 
         return span;

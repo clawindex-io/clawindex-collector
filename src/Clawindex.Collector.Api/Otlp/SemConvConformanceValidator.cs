@@ -2,8 +2,12 @@ namespace Clawindex.Collector.Api.Otlp;
 
 public sealed class SemConvConformanceValidator
 {
-    private static readonly Guid NilGuid = Guid.Empty;
-    private static readonly Guid SentinelGuid = new("00000000-0000-0000-0000-000000000001");
+    private static readonly HashSet<string> AgentIdDenylist = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "agent", "test", "null", "none", "unknown", "id", "default",
+        "00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000001"
+    };
 
     public ValidationResult Validate(FlatSpan flatSpan)
     {
@@ -34,14 +38,16 @@ public sealed class SemConvConformanceValidator
         var inputTokens = ParseTokens(attrs, "gen_ai.usage.input_tokens");
         var outputTokens = ParseTokens(attrs, "gen_ai.usage.output_tokens");
 
-        // Agent ID: parse as GUID; raw string survives in RawAttributes regardless (amendment 3)
-        Guid? agentId = null;
-        if (attrs.TryGetValue("gen_ai.agent.id", out var agentIdStr) && !string.IsNullOrEmpty(agentIdStr))
+        // Agent ID: clawindex.agent.id is a ClawIndex-owned key for stable logical agent identity.
+        // Value rules: non-empty after trim, length >= 8, not in the placeholder denylist.
+        // A GUID is a valid value; GUID format is not required.
+        string? agentId = null;
+        var agentIdRaw = GetNonEmpty(attrs, "clawindex.agent.id");
+        if (agentIdRaw != null)
         {
-            if (Guid.TryParse(agentIdStr, out var guid) && guid != NilGuid && guid != SentinelGuid)
-            {
-                agentId = guid;
-            }
+            var trimmed = agentIdRaw.Trim();
+            if (trimmed.Length >= 8 && !AgentIdDenylist.Contains(trimmed))
+                agentId = trimmed;
         }
 
         var isConformant = provider != null
@@ -49,7 +55,7 @@ public sealed class SemConvConformanceValidator
             && model != null
             && inputTokens.HasValue
             && outputTokens.HasValue
-            && agentId.HasValue;
+            && agentId != null;
 
         var startTime = NanosToOffset(span.StartTimeUnixNano);
         var isComplete = span.EndTimeUnixNano > 0;

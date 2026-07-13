@@ -15,6 +15,8 @@ public sealed class InMemorySpanSink : IValidatedSpanSink
 
     public IReadOnlyList<ValidatedSpan> Received => _received.ToArray();
 
+    public void Clear() => _received.Clear();
+
     public Task AcceptAsync(IReadOnlyList<ValidatedSpan> spans, CancellationToken cancellationToken = default)
     {
         foreach (var span in spans)
