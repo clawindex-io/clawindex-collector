@@ -20,7 +20,7 @@ public sealed class DurableSpanSinkTests
         string? model = "gpt-4o",
         long? inputTokens = 100,
         long? outputTokens = 50,
-        Guid? agentId = null,
+        string? agentId = null,
         DateTimeOffset? startTime = null,
         DateTimeOffset? endTime = null) =>
         new(
@@ -36,7 +36,7 @@ public sealed class DurableSpanSinkTests
             Model: isConformant ? model : null,
             InputTokens: isConformant ? inputTokens : null,
             OutputTokens: isConformant ? outputTokens : null,
-            AgentId: isConformant ? (agentId ?? Guid.NewGuid()) : null,
+            AgentId: isConformant ? (agentId ?? "svc-default-agent") : null,
             IsConformant: isConformant,
             IsComplete: isComplete,
             OtlpStatus: otlpStatus,
@@ -73,7 +73,7 @@ public sealed class DurableSpanSinkTests
     public async Task ConformantSpan_ProjectsCorrectly()
     {
         using var fixture = new DurableSinkFixture();
-        var agentId = Guid.NewGuid();
+        var agentId = "svc-chat-prod-v1";
         var span = MakeSpan("aaaa0000000000aa", "bbbb0000000000000000000000000000", agentId: agentId);
 
         await fixture.Sink.AcceptAsync([span]);
@@ -87,7 +87,7 @@ public sealed class DurableSpanSinkTests
         Assert.Equal("gpt-4o", row.Model);
         Assert.Equal(100, row.InputTokens);
         Assert.Equal(50, row.OutputTokens);
-        Assert.Equal(agentId.ToString(), row.AgentId);
+        Assert.Equal(agentId, row.AgentId);
         Assert.True(row.IsConformant);
         Assert.Equal("unset", row.Status);
 

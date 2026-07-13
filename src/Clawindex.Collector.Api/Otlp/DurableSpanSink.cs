@@ -46,7 +46,7 @@ public sealed class DurableSpanSink(EventRepository repository, ILogger<DurableS
         var traceState = new TraceState(
             TraceId: span.TraceId,
             RootSpanId: isRoot ? span.SpanId : null,
-            AgentId: span.AgentId?.ToString(),
+            AgentId: span.AgentId,
             Status: isRoot ? "finalized" : "open",
             StartedAt: span.StartTime,
             EndedAt: isRoot ? span.EndTime : null,
@@ -59,7 +59,7 @@ public sealed class DurableSpanSink(EventRepository repository, ILogger<DurableS
         SpanId: span.SpanId,
         TraceId: span.TraceId,
         ParentSpanId: span.ParentSpanId,
-        AgentId: span.AgentId?.ToString(),
+        AgentId: span.AgentId,
         SpanName: span.Name,
         SpanKind: KindToString(span.Kind),
         Status: span.OtlpStatus,

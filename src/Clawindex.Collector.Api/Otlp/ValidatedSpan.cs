@@ -13,7 +13,7 @@ public sealed record ValidatedSpan(
     string? Model,
     long? InputTokens,
     long? OutputTokens,
-    Guid? AgentId,
+    string? AgentId,
     bool IsConformant,
     bool IsComplete,
     string OtlpStatus,
