@@ -66,6 +66,22 @@ A GUID is a perfectly valid value for `clawindex.agent.id`. GUID format is not r
 
 `clawindex.agent.id` is an identifier, not a secret. It appears in telemetry, the read API, and any viewer pointed at the collector. Do not treat it as a credential.
 
+## Recommended but not required: service.name
+
+The ClawIndex conformance floor is the GenAI SemConv floor (operation, provider,
+model, input/output tokens) plus one ClawIndex-required field (`clawindex.agent.id`).
+The OTel resource attribute `service.name` is NOT part of the floor and is not required
+for conformance.
+
+It is nonetheless strongly recommended. ClawIndex forwards telemetry byte-identically
+to your configured destinations, and downstream viewers group telemetry by
+`service.name`. Telemetry emitted without it appears as `unknown_service` in
+Datadog, Aspire, Grafana, and similar tools.
+
+`service.name` is a Resource attribute, set once on the TracerProvider — not a
+span attribute. Setting it does not affect ClawIndex's projection, conformance
+evaluation, or agent identity, all of which key on `clawindex.agent.id`.
+
 ## Anti-Gaming Posture
 
 Conformance is surfaced, not hidden. The collector tracks a **per-agent conformance ratio** (conformance-complete spans / total spans for that agent). This ratio is a first-class signal in the agent view, so an integrator who emits SemConv spans without the useful floor fields sees their own instrumentation quality reflected back, rather than silently passing as integrated.

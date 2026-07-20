@@ -25,6 +25,7 @@ from decimal import Decimal
 import requests
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
@@ -124,7 +125,8 @@ def setup_tracer(collector_base_url: str) -> trace.Tracer:
     Only the OTEL_EXPORTER_OTLP_ENDPOINT env var auto-appends /v1/traces.
     """
     exporter = OTLPSpanExporter(endpoint=f"{collector_base_url}/v1/traces")
-    provider = TracerProvider()
+    resource = Resource.create({"service.name": "clawindex-smoke"})
+    provider = TracerProvider(resource=resource)
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
     return trace.get_tracer("clawindex-smoke")
