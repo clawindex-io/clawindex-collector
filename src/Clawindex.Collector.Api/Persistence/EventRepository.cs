@@ -59,6 +59,8 @@ public sealed class EventRepository(IConfiguration configuration)
         await EnsureProjectionColumnsAsync(connection);
         await BackfillProjectionStatusAsync(connection);
         await ResetInProgressProjectionsAsync(connection);
+        await InitializeForwardQueueAsync(connection);
+        await ResetInProgressForwardDeliveriesAsync(connection);
     }
 
     public async Task InsertAsync(AcceptedEvent acceptedEvent)
@@ -1093,5 +1095,217 @@ public sealed class EventRepository(IConfiguration configuration)
         return Environment.GetEnvironmentVariable("CLAWINDEX_DB_PATH")
             ?? configuration["Clawindex:DatabasePath"]
             ?? Path.Combine(AppContext.BaseDirectory, "data", "clawindex-collector.db");
+    }
+
+    // -------------------------------------------------------------------------
+    // Forward queue
+    // -------------------------------------------------------------------------
+
+    public async Task EnqueueForwardAsync(
+        byte[] payload,
+        string contentType,
+        IReadOnlyList<string> destinationNames,
+        CancellationToken ct = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(ct);
+
+        var id  = Guid.NewGuid().ToString();
+        var now = DateTimeOffset.UtcNow.ToString("O");
+
+        await using var insertQueue = connection.CreateCommand();
+        insertQueue.Transaction = (SqliteTransaction)transaction;
+        insertQueue.CommandText =
+            """
+            INSERT INTO forward_queue (id, payload, content_type, enqueued_at)
+            VALUES ($id, $payload, $content_type, $enqueued_at);
+            """;
+        insertQueue.Parameters.AddWithValue("$id",           id);
+        insertQueue.Parameters.AddWithValue("$payload",      payload);
+        insertQueue.Parameters.AddWithValue("$content_type", contentType);
+        insertQueue.Parameters.AddWithValue("$enqueued_at",  now);
+        await insertQueue.ExecuteNonQueryAsync(ct);
+
+        foreach (var name in destinationNames)
+        {
+            await using var insertDelivery = connection.CreateCommand();
+            insertDelivery.Transaction = (SqliteTransaction)transaction;
+            insertDelivery.CommandText =
+                """
+                INSERT INTO forward_delivery (queue_item_id, destination_name, status)
+                VALUES ($queue_item_id, $destination_name, 'pending');
+                """;
+            insertDelivery.Parameters.AddWithValue("$queue_item_id",    id);
+            insertDelivery.Parameters.AddWithValue("$destination_name", name);
+            await insertDelivery.ExecuteNonQueryAsync(ct);
+        }
+
+        await transaction.CommitAsync(ct);
+    }
+
+    public async Task<IReadOnlyList<ForwardDelivery>> GetPendingForwardDeliveriesAsync(
+        int limit,
+        CancellationToken ct = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(ct);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT q.id, q.payload, q.content_type, d.destination_name
+            FROM forward_delivery d
+            JOIN forward_queue q ON q.id = d.queue_item_id
+            WHERE d.status = 'pending'
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$limit", limit);
+
+        var results = new List<ForwardDelivery>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            results.Add(new ForwardDelivery(
+                QueueItemId:     reader.GetString(0),
+                Payload:         (byte[])reader.GetValue(1),
+                ContentType:     reader.GetString(2),
+                DestinationName: reader.GetString(3)));
+        }
+        return results;
+    }
+
+    public async Task MarkForwardAttemptAsync(
+        string queueItemId,
+        string destinationName,
+        CancellationToken ct = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(ct);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE forward_delivery
+            SET status       = 'in_progress',
+                attempts     = attempts + 1,
+                attempted_at = $now
+            WHERE queue_item_id    = $queue_item_id
+              AND destination_name = $destination_name
+              AND status           = 'pending';
+            """;
+        command.Parameters.AddWithValue("$now",              DateTimeOffset.UtcNow.ToString("O"));
+        command.Parameters.AddWithValue("$queue_item_id",    queueItemId);
+        command.Parameters.AddWithValue("$destination_name", destinationName);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task MarkForwardDeliveredAsync(
+        string queueItemId,
+        string destinationName,
+        CancellationToken ct = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(ct);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE forward_delivery
+            SET status = 'delivered'
+            WHERE queue_item_id    = $queue_item_id
+              AND destination_name = $destination_name;
+            """;
+        command.Parameters.AddWithValue("$queue_item_id",    queueItemId);
+        command.Parameters.AddWithValue("$destination_name", destinationName);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task MarkForwardFailedAsync(
+        string queueItemId,
+        string destinationName,
+        string error,
+        CancellationToken ct = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(ct);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE forward_delivery
+            SET status = 'failed',
+                error  = $error
+            WHERE queue_item_id    = $queue_item_id
+              AND destination_name = $destination_name;
+            """;
+        command.Parameters.AddWithValue("$error",            error);
+        command.Parameters.AddWithValue("$queue_item_id",    queueItemId);
+        command.Parameters.AddWithValue("$destination_name", destinationName);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task<IReadOnlyList<string>> GetForwardDeliveryStatusAsync(
+        string destinationName,
+        CancellationToken ct = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(ct);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT status
+            FROM forward_delivery
+            WHERE destination_name = $destination_name;
+            """;
+        command.Parameters.AddWithValue("$destination_name", destinationName);
+
+        var results = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            results.Add(reader.GetString(0));
+        return results;
+    }
+
+    private static async Task InitializeForwardQueueAsync(SqliteConnection connection)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            CREATE TABLE IF NOT EXISTS forward_queue (
+              id           TEXT PRIMARY KEY,
+              payload      BLOB NOT NULL,
+              content_type TEXT NOT NULL,
+              enqueued_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS forward_delivery (
+              queue_item_id    TEXT NOT NULL,
+              destination_name TEXT NOT NULL,
+              status           TEXT NOT NULL DEFAULT 'pending',
+              attempts         INTEGER NOT NULL DEFAULT 0,
+              attempted_at     TEXT NULL,
+              error            TEXT NULL,
+              PRIMARY KEY (queue_item_id, destination_name)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_forward_delivery_pending
+              ON forward_delivery(status)
+              WHERE status IN ('pending', 'in_progress');
+            """;
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task ResetInProgressForwardDeliveriesAsync(SqliteConnection connection)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            UPDATE forward_delivery
+            SET status = 'pending'
+            WHERE status = 'in_progress';
+            """;
+        await command.ExecuteNonQueryAsync();
     }
 }

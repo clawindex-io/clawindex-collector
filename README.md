@@ -36,7 +36,90 @@ AGPL-3.0. Copyright Range Point AI, 2026. See [LICENSE](LICENSE).
 
 There is a separate proprietary managed tier (the hosted economics/accountability layer). This open-core repository never depends on or references it.
 
+## Fan-out / destinations
+
+ClawIndex can forward incoming telemetry byte-identically to any number of downstream OTLP/HTTP endpoints (your Grafana, Aspire, Datadog agent, etc.) so you only need to configure one collector endpoint on your agents.
+
+Forwarding is durable (backed by SQLite) and off the request path — a slow or dead destination never delays or breaks `/v1/traces`. v1 makes one delivery attempt per item; failed deliveries are marked and not retried (best-effort, lossy under destination failure).
+
+> **Note:** v1 forwarding is best-effort. If a destination is unreachable at delivery time, the payload is lost for that destination. Retry policy is a future slice.
+
+### Configuration — appsettings.json
+
+```json
+{
+  "Clawindex": {
+    "Destinations": [
+      {
+        "Name":     "aspire",
+        "Type":     "otlp-http",
+        "Endpoint": "http://aspire:18890/v1/traces",
+        "Enabled":  true
+      },
+      {
+        "Name":     "datadog",
+        "Type":     "otlp-http",
+        "Endpoint": "http://datadog-agent:4318/v1/traces",
+        "Enabled":  true,
+        "Headers":  { "DD-API-KEY": "..." }
+      }
+    ]
+  }
+}
+```
+
+For Aspire: use the **HTTP** OTLP endpoint (port **18890**), not the gRPC default (18889).
+
+### Configuration — environment variables only
+
+Use the ASP.NET Core double-underscore convention. Hyphens in header key names are literal characters and do not need escaping:
+
+```
+Clawindex__Destinations__0__Name=aspire
+Clawindex__Destinations__0__Type=otlp-http
+Clawindex__Destinations__0__Endpoint=http://aspire:18890/v1/traces
+Clawindex__Destinations__0__Enabled=true
+
+Clawindex__Destinations__1__Name=datadog
+Clawindex__Destinations__1__Type=otlp-http
+Clawindex__Destinations__1__Endpoint=http://datadog-agent:4318/v1/traces
+Clawindex__Destinations__1__Enabled=true
+Clawindex__Destinations__1__Headers__DD-API-KEY=secret
+```
+
+Adding or changing a destination requires only a **container restart** — never an image rebuild.
+
+> **Secret management:** supply auth header values via environment variables or a mounted config file. Do not commit secret values to appsettings.json.
+
+### docker-compose example
+
+```yaml
+services:
+  collector:
+    image: clawindex-collector:latest
+    ports:
+      - "5000:8080"
+    environment:
+      CLAWINDEX_DB_PATH: /data/clawindex.db
+      Clawindex__Destinations__0__Name: aspire
+      Clawindex__Destinations__0__Type: otlp-http
+      Clawindex__Destinations__0__Endpoint: http://aspire:18890/v1/traces
+      Clawindex__Destinations__0__Enabled: "true"
+    volumes:
+      - clawindex-data:/data
+
+  aspire:
+    image: mcr.microsoft.com/dotnet/aspire-dashboard:latest
+    ports:
+      - "18888:18888"   # UI
+      - "18890:18890"   # OTLP/HTTP
+
+volumes:
+  clawindex-data:
+```
+
 ## Project documents
 
 - [Strategic decision record](docs/strategic-decision-record.md) — product definition and the decisions that direct the build.
 - [Ingestion contract & conformance floor](docs/read-api-ingestion-contract.md).
+- [Fan-out spec](docs/spec-fanout.md) — design rationale for the forwarding feature.
