@@ -116,6 +116,25 @@ The model is hardcoded to `claude-sonnet-4-6`. To test with a different model:
 The model must exist in `pricing.json` or the cost assertion will fail with a mismatch
 (the collector will show `cost_coverage < 1.0` and `estimated_cost_usd = null`).
 
+## A note on service.name
+
+ClawIndex does not require the OTel resource attribute `service.name`. Agent identity
+in ClawIndex is `clawindex.agent.id`, a span attribute.
+
+However, `service.name` is a Resource attribute that downstream viewers (Aspire,
+Datadog, Grafana, Jaeger) use to group telemetry. If it is not set, your spans
+arrive there as `unknown_service`. Because ClawIndex forwards your telemetry
+verbatim to your configured destinations, unset `service.name` shows up as
+`unknown_service` in your own tooling.
+
+Set it on the TracerProvider's Resource, not on individual spans:
+
+```python
+from opentelemetry.sdk.resources import Resource
+resource = Resource.create({"service.name": "your-agent-service"})
+provider = TracerProvider(resource=resource)
+```
+
 ## How it works
 
 - **3 traces × 2 spans each** (root + child) = 6 total spans, all carrying the full
