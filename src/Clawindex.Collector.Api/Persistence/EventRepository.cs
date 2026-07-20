@@ -1016,10 +1016,7 @@ public sealed class EventRepository(IConfiguration configuration)
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            DROP TABLE IF EXISTS span_state;
-            DROP TABLE IF EXISTS trace_state;
-
-            CREATE TABLE trace_state (
+            CREATE TABLE IF NOT EXISTS trace_state (
               trace_id TEXT PRIMARY KEY,
               root_span_id TEXT NULL,
               agent_id TEXT NULL,
@@ -1029,7 +1026,7 @@ public sealed class EventRepository(IConfiguration configuration)
               updated_at TEXT NOT NULL
             );
 
-            CREATE TABLE span_state (
+            CREATE TABLE IF NOT EXISTS span_state (
               span_id TEXT PRIMARY KEY,
               trace_id TEXT NOT NULL,
               parent_span_id TEXT NULL,
@@ -1049,7 +1046,7 @@ public sealed class EventRepository(IConfiguration configuration)
               updated_at TEXT NOT NULL
             );
 
-            CREATE INDEX idx_span_state_trace_status
+            CREATE INDEX IF NOT EXISTS idx_span_state_trace_status
               ON span_state(trace_id, status);
 
             CREATE TABLE IF NOT EXISTS event_span_map (
