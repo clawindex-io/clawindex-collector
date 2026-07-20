@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Clawindex.Collector.Api;
 using Clawindex.Collector.Api.Economics;
+using Clawindex.Collector.Api.Fanout;
 using Clawindex.Collector.Api.Otlp;
 using Clawindex.Collector.Api.Persistence;
 using Clawindex.Collector.Api.Projection;
@@ -27,6 +28,44 @@ builder.Services.AddSingleton<SemConvConformanceValidator>();
 builder.Services.AddSingleton<InMemorySpanSink>();
 builder.Services.AddSingleton<DurableSpanSink>();
 builder.Services.AddSingleton<IValidatedSpanSink>(sp => sp.GetRequiredService<DurableSpanSink>());
+
+// Fan-out destinations — read from config; no image rebuild required to change them.
+// Header values go into DefaultRequestHeaders and are never logged.
+var destConfigs = builder.Configuration
+    .GetSection("Clawindex:Destinations")
+    .Get<List<DestinationConfig>>() ?? [];
+
+// Always register IHttpClientFactory even when no named clients are configured.
+builder.Services.AddHttpClient();
+
+foreach (var cfg in destConfigs)
+{
+    builder.Services.AddHttpClient($"dest-{cfg.Name}", client =>
+    {
+        foreach (var (k, v) in cfg.Headers)
+            client.DefaultRequestHeaders.TryAddWithoutValidation(k, v);
+    });
+}
+
+builder.Services.AddSingleton<IReadOnlyList<ITelemetryDestination>>(sp =>
+{
+    var factory = sp.GetRequiredService<IHttpClientFactory>();
+    return destConfigs.Select<DestinationConfig, ITelemetryDestination>(cfg => cfg.Type switch
+    {
+        "otlp-http" => new OtlpHttpDestination(cfg, factory.CreateClient($"dest-{cfg.Name}")),
+        _ => throw new InvalidOperationException($"Unknown destination type '{cfg.Type}'")
+    }).ToList();
+});
+
+builder.Services.AddSingleton<ForwardQueue>();
+builder.Services.AddSingleton<ForwardDispatcher>();
+
+if (builder.Configuration.GetValue("Clawindex:Forwarding:Enabled", true)
+    && destConfigs.Any(d => d.Enabled))
+{
+    builder.Services.AddHostedService<ForwardWorker>();
+}
+
 builder.Services.AddOpenApi();
 builder.Services.AddOpenTelemetry()
     .ConfigureResource(resource => resource.AddService(ClawindexTelemetry.ServiceName, serviceVersion: "0.1.0"))
@@ -181,9 +220,12 @@ app.MapPost("/v1/traces", async (
     SpanFlattener flattener,
     SemConvConformanceValidator validator,
     IValidatedSpanSink sink,
+    ForwardQueue forwardQueue,
     CancellationToken cancellationToken) =>
 {
-    var rawBody = await ReadBinaryBodyAsync(request);
+    var rawBody     = await ReadBinaryBodyAsync(request);
+    var contentType = request.ContentType ?? "application/x-protobuf";
+
     if (rawBody.Length == 0)
     {
         return Results.BadRequest(Rejected("Request body must not be empty"));
@@ -220,6 +262,10 @@ app.MapPost("/v1/traces", async (
     {
         await sink.AcceptAsync(validatedSpans, cancellationToken);
     }
+
+    // Enqueue for forwarding AFTER the durable write — persist-first is enforced by code order.
+    // TryEnqueueAsync never throws; no-op if no destinations are configured.
+    await forwardQueue.TryEnqueueAsync(rawBody, contentType, cancellationToken);
 
     var response = new ExportTraceServiceResponse();
     if (rejectedCount > 0)
