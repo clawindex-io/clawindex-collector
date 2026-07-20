@@ -56,7 +56,7 @@ public sealed class DurableSpanSinkTests
         {
             _dbPath = Path.Combine(Path.GetTempPath(), $"clawindex-test-{Guid.NewGuid():N}.db");
             var config = new ConfigurationBuilder()
-                .AddInMemoryCollection(new Dictionary<string, string?> { ["CLAWINDEX_DB_PATH"] = _dbPath })
+                .AddInMemoryCollection(new Dictionary<string, string?> { ["Clawindex:DatabasePath"] = _dbPath })
                 .Build();
             Repository = new EventRepository(config);
             Repository.InitializeAsync().GetAwaiter().GetResult();
@@ -328,5 +328,48 @@ public sealed class DurableSpanSinkTests
         Assert.NotNull(row);
         Assert.Equal("unset", row.Status);
         Assert.Equal("gpt-4o", row.Model);
+    }
+
+    // Regression test for issue #55: span_state and trace_state were dropped on every
+    // call to InitializeAsync, destroying all persisted telemetry on restart.
+    [Fact]
+    public async Task SpansAndTraces_SurviveRepositoryRestart()
+    {
+        var dbPath = Path.Combine(Path.GetTempPath(), $"clawindex-restart-test-{Guid.NewGuid():N}.db");
+        try
+        {
+            var config = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?> { ["Clawindex:DatabasePath"] = dbPath })
+                .Build();
+
+            // First lifetime — write spans
+            var repo1 = new EventRepository(config);
+            await repo1.InitializeAsync();
+            var sink1 = new DurableSpanSink(repo1, NullLogger<DurableSpanSink>.Instance);
+
+            var span = MakeSpan("aaaa0000000000aa", "bbbb0000000000000000000000000000",
+                agentId: "svc-durability-check");
+            await sink1.AcceptAsync([span]);
+
+            var beforeRestart = await repo1.GetSpanStateAsync("aaaa0000000000aa");
+            Assert.NotNull(beforeRestart);
+
+            // Second lifetime — simulate restart by calling InitializeAsync on the same DB
+            var repo2 = new EventRepository(config);
+            await repo2.InitializeAsync();
+
+            var afterRestart = await repo2.GetSpanStateAsync("aaaa0000000000aa");
+            Assert.NotNull(afterRestart);
+            Assert.Equal("aaaa0000000000aa", afterRestart.SpanId);
+            Assert.Equal("svc-durability-check", afterRestart.AgentId);
+
+            var trace = await repo2.GetTraceStateAsync("bbbb0000000000000000000000000000");
+            Assert.NotNull(trace);
+            Assert.Equal("finalized", trace.Status);
+        }
+        finally
+        {
+            if (File.Exists(dbPath)) File.Delete(dbPath);
+        }
     }
 }
