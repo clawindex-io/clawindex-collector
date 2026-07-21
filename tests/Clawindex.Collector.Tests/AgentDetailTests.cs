@@ -442,12 +442,86 @@ public sealed class AgentDetailTests
     // Endpoint — GET /v1/agents/{id}
     // -------------------------------------------------------------------------
 
+    // ── agent id validation — issue #50 fix ───────────────────────────────────
+
     [Fact]
-    public async Task GetAgentDetail_NonGuidId_Returns400()
+    public async Task GetAgentDetail_ValidNonGuidId_Returns200()
+    {
+        using var fixture = new CollectorFixture();
+        const string nonGuidId = "svc-contract-ana-b2c3d4e5-f6a7-8901-bcde-f12345678901";
+        using var response = await fixture.CreateClient().GetAsync(
+            $"/v1/agents/{nonGuidId}?since=2025-01-01T00:00:00Z&until=2025-02-01T00:00:00Z");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(nonGuidId, body.RootElement.GetProperty("agent_id").GetString());
+        Assert.Equal(0, body.RootElement.GetProperty("rollup").GetProperty("span_count").GetInt64());
+    }
+
+    [Fact]
+    public async Task GetAgentDetail_ValidGuidId_StillReturns200()
+    {
+        using var fixture = new CollectorFixture();
+        var id = Guid.NewGuid();
+        using var response = await fixture.CreateClient().GetAsync(
+            $"/v1/agents/{id}?since=2025-01-01T00:00:00Z&until=2025-02-01T00:00:00Z");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("tiny")]       // 4 chars — below the 8-char minimum
+    [InlineData("abcdefg")]    // 7 chars — one short of the minimum
+    public async Task GetAgentDetail_IdShorterThan8Chars_Returns400(string shortId)
     {
         using var fixture = new CollectorFixture();
         using var response = await fixture.CreateClient().GetAsync(
-            "/v1/agents/not-a-guid?since=2025-01-01T00:00:00Z&until=2025-02-01T00:00:00Z");
+            $"/v1/agents/{shortId}?since=2025-01-01T00:00:00Z&until=2025-02-01T00:00:00Z");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("validation_failed", body.RootElement.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [Theory]
+    [InlineData("unknown")]
+    [InlineData("UNKNOWN")]
+    [InlineData("default")]
+    [InlineData("00000000-0000-0000-0000-000000000000")]
+    public async Task GetAgentDetail_DenylistId_Returns400(string deniedId)
+    {
+        using var fixture = new CollectorFixture();
+        using var response = await fixture.CreateClient().GetAsync(
+            $"/v1/agents/{deniedId}?since=2025-01-01T00:00:00Z&until=2025-02-01T00:00:00Z");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("validation_failed", body.RootElement.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task GetAgentDetail_ValidNonGuidId_NoData_Returns200WithZeroedRollup()
+    {
+        using var fixture = new CollectorFixture();
+        const string id = "svc-no-data-here-deadbeef";
+        using var response = await fixture.CreateClient().GetAsync(
+            $"/v1/agents/{id}?since=2020-01-01T00:00:00Z&until=2020-02-01T00:00:00Z");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(id, body.RootElement.GetProperty("agent_id").GetString());
+        Assert.Equal(0, body.RootElement.GetProperty("rollup").GetProperty("span_count").GetInt64());
+        Assert.Equal(0, body.RootElement.GetProperty("recent_traces").GetArrayLength());
+    }
+
+    [Fact]
+    public async Task GetAgentDetail_NonGuidId_Returns400()
+    {
+        // This test is preserved for historical naming. It now specifically exercises the
+        // < 8-char rule — the rejection is no longer "must be a GUID" but "too short".
+        using var fixture = new CollectorFixture();
+        using var response = await fixture.CreateClient().GetAsync(
+            "/v1/agents/short?since=2025-01-01T00:00:00Z&until=2025-02-01T00:00:00Z");
         using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);

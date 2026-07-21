@@ -149,8 +149,10 @@ app.MapGet("/v1/agents/{id}", async (
     TimeProvider timeProvider,
     CancellationToken cancellationToken) =>
 {
-    if (!Guid.TryParse(id, out _))
-        return Results.BadRequest(Rejected("'id' must be a valid GUID"));
+    var (idError, normalizedId) = AgentIdValidator.ValidateQueryId(id);
+    if (idError is not null)
+        return Results.BadRequest(Rejected(idError));
+    id = normalizedId!;
 
     var (windowError, sinceValue, untilValue) = ParseWindow(since, until, timeProvider.GetUtcNow());
     if (windowError is not null) return windowError;
