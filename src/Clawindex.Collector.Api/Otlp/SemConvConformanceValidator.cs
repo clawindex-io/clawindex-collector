@@ -2,12 +2,6 @@ namespace Clawindex.Collector.Api.Otlp;
 
 public sealed class SemConvConformanceValidator
 {
-    private static readonly HashSet<string> AgentIdDenylist = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "agent", "test", "null", "none", "unknown", "id", "default",
-        "00000000-0000-0000-0000-000000000000",
-        "00000000-0000-0000-0000-000000000001"
-    };
 
     public ValidationResult Validate(FlatSpan flatSpan)
     {
@@ -41,14 +35,7 @@ public sealed class SemConvConformanceValidator
         // Agent ID: clawindex.agent.id is a ClawIndex-owned key for stable logical agent identity.
         // Value rules: non-empty after trim, length >= 8, not in the placeholder denylist.
         // A GUID is a valid value; GUID format is not required.
-        string? agentId = null;
-        var agentIdRaw = GetNonEmpty(attrs, "clawindex.agent.id");
-        if (agentIdRaw != null)
-        {
-            var trimmed = agentIdRaw.Trim();
-            if (trimmed.Length >= 8 && !AgentIdDenylist.Contains(trimmed))
-                agentId = trimmed;
-        }
+        var agentId = AgentIdValidator.TryNormalize(GetNonEmpty(attrs, "clawindex.agent.id"));
 
         var isConformant = provider != null
             && operation != null
