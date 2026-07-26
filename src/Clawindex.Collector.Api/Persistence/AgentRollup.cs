@@ -35,4 +35,10 @@ public sealed record AgentRollup(
 
     [JsonPropertyName("pricing_stale")]
     public bool PricingStale { get; init; }
+
+    [JsonPropertyName("total_input_tokens")]
+    public long TotalInputTokens { get; init; }
+
+    [JsonPropertyName("total_output_tokens")]
+    public long TotalOutputTokens { get; init; }
 }

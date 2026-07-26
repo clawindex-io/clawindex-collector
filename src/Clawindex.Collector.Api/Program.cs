@@ -66,6 +66,10 @@ if (builder.Configuration.GetValue("Clawindex:Forwarding:Enabled", true)
     builder.Services.AddHostedService<ForwardWorker>();
 }
 
+builder.Services.AddCors(options =>
+    options.AddDefaultPolicy(policy =>
+        policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
+
 builder.Services.AddOpenApi();
 builder.Services.AddOpenTelemetry()
     .ConfigureResource(resource => resource.AddService(ClawindexTelemetry.ServiceName, serviceVersion: "0.1.0"))
@@ -77,6 +81,8 @@ builder.Services.AddOpenTelemetry()
     });
 
 var app = builder.Build();
+
+app.UseCors();
 
 using (var scope = app.Services.CreateScope())
 {
@@ -128,7 +134,9 @@ app.MapGet("/v1/agents", async (
             UncostedSpanCount          = cost.UncostedSpanCount,
             CostCoverage               = cost.CostCoverage,
             PricedAsOf                 = cost.PricedAsOf,
-            PricingStale               = cost.PricingStale
+            PricingStale               = cost.PricingStale,
+            TotalInputTokens           = groups.Sum(g => g.InputTokens),
+            TotalOutputTokens          = groups.Sum(g => g.OutputTokens)
         };
     });
 
