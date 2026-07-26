@@ -41,6 +41,20 @@ and latest_seen return null. Do not omit these fields — the dashboard's
 honesty principle (present, do not fabricate or omit) applies to this
 zero-case exactly as it does to the dashboard itself.
 
+## MVP framing — no backward-compatibility concern
+
+There are no current users of this API. The response shape is changing from
+a bare array to an object with agents + unattributed keys, and that is fine
+— there is nothing external to preserve compatibility with.
+
+The ONE thing this must remain compatible with: the chaos fleet (tools/chaos/
+chaos.py) and the dashboard's existing verification flow against it. The
+dashboard's data.js currently parses the /v1/agents response as a bare
+array; this response-shape change means data.js needs a corresponding
+one-line update (read response.agents instead of the response itself) as
+part of landing this feature end-to-end. That is expected, coordinated work
+— not a compatibility break to design around.
+
 ## Reference
 
 - #20/#21 established the AgentRollup read pattern and since/until window
@@ -96,9 +110,6 @@ and write the query accordingly. Do not assume; verify against the code.
   identity, so nothing here should attempt to reconstruct one.
 - No cross-tenant anything, consistent with every other endpoint in this
   API.
-- This is additive to the existing /v1/agents response — the agents array
-  and its per-agent shape are unchanged. Existing consumers of the agents
-  array must not break.
 
 ## Tests
 
@@ -117,6 +128,8 @@ pattern):
   pattern for the default trailing-30-day window.
 - A test specifically exercising whichever of (a)/(b)/(c) above turns out to
   be true, so the resolved behavior has a regression test pinning it.
+- Confirm the chaos fleet still parses correctly end-to-end against the new
+  response shape (agents key present and correctly populated).
 
 ## Out of scope
 
