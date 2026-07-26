@@ -1,4 +1,4 @@
-# Implementation Spec — Unattributed Telemetry ("Dark Activity") Endpoint
+# Implementation Spec — Unattributed Telemetry ("Dark Activity") in GET /v1/agents
 
 ## Goal
 
@@ -12,91 +12,120 @@ Frame this as a security/governance finding, not a cost/economics one. An
 unattributed span means an unregistered or unknown source is emitting
 telemetry — categorically different from an identified-but-uncostable agent.
 
+## Design: single call, not a separate endpoint
+
+Unattributed telemetry is returned as a new top-level sibling field in the
+existing GET /v1/agents response, NOT a separate GET /v1/unattributed
+endpoint. The dashboard makes one fetch to /v1/agents; it should not need a
+second round trip to get the other half of the same picture.
+
+This field sits alongside the agents array, not inside it and not on any
+individual agent row — unattributed spans are explicitly not agent-scoped,
+so they must not be shaped like one.
+
+Response shape:
+
+{
+  "agents": [ ...existing per-agent rollups, unchanged... ],
+  "unattributed": {
+    "count": 42,
+    "service_names": ["unknown-checkout-svc", "legacy-batch-job"],
+    "models": ["gpt-4o-mini", "claude-3-haiku"],
+    "earliest_seen": "2026-07-01T00:00:00Z",
+    "latest_seen": "2026-07-24T18:32:00Z"
+  }
+}
+
+If count is 0: service_names and models return as empty arrays, earliest_seen
+and latest_seen return null. Do not omit these fields — the dashboard's
+honesty principle (present, do not fabricate or omit) applies to this
+zero-case exactly as it does to the dashboard itself.
+
 ## Reference
 
 - #20/#21 established the AgentRollup read pattern and since/until window
-  handling. Reuse both.
+  handling. Reuse both for the unattributed aggregation's window.
 - #43 established clawindex.agent.id validation (AgentIdValidator.cs) as the
   single source of truth for what counts as a valid agent id.
 - docs/read-api-ingestion-contract.md defines the existing read-API contract
-  this endpoint extends.
+  this response extends.
+- The locked GenAI SemConv conformance floor (from the conformance-floor
+  design discussion) names gen_ai.request.model as the model attribute,
+  alongside gen_ai.operation.name, gen_ai.provider.name, and the two
+  usage.*_tokens fields. The "models" field below uses this same attribute
+  for consistency with how conformance and cost estimation already key off
+  it elsewhere in the system.
 
 ## Scope
 
-New endpoint: GET /v1/unattributed (or a field addition — see "Open question"
-below; default assumption is a new endpoint unless review prefers otherwise).
-
-For the current window (same since/until / trailing-30-day default as
-/v1/agents), over span_state rows where agent_id IS NULL or fails
+For the current window (same since/until / trailing-30-day default already
+used by /v1/agents), over span_state rows where agent_id IS NULL or fails
 AgentIdValidator:
 
 - count: total unattributed span count in the window.
 - service_names: distinct service.name values observed among them.
-- models: distinct model values observed among them (gen_ai.request.model or
-  equivalent SemConv attribute, wherever it's captured on the span).
-- time_range: earliest and latest span timestamp in the window.
+- models: distinct gen_ai.request.model values observed among them.
+- earliest_seen / latest_seen: earliest and latest span timestamp in the
+  window.
+
+## OPEN QUESTION — must resolve during planning, before implementation
+
+It is not yet confirmed whether spans that fail AgentIdValidator are:
+(a) persisted with the invalid agent_id value as-is,
+(b) nulled out before persistence, or
+(c) rejected entirely and never stored.
+
+This determines the actual WHERE clause for "unattributed" — if (b) or (c),
+"agent_id IS NULL" alone may be sufficient and "fails AgentIdValidator" is
+dead code; if (a), the query must independently re-validate agent_id at read
+time, which duplicates validation logic between ingestion and this read path
+and should be flagged as a maintenance point (two places to keep in sync).
+
+The plan step must read the actual ingestion/mapper code (wherever
+AgentIdValidator is invoked in the write path, e.g. the SemConv conformance
+validator and/or DurableSpanSink) to confirm which of (a)/(b)/(c) is true,
+and write the query accordingly. Do not assume; verify against the code.
 
 ## Constraints
 
 - Single-tenant only. Read-time only over persisted span_state. No writes,
   no schema changes to ingestion or projection.
 - Do NOT expose span content, payload, or any per-span detail beyond the
-  four aggregate fields above. This is a metadata/count surface, not a
+  five aggregate fields above. This is a metadata/count surface, not a
   drill-down — the entire point is these spans have no attributable
   identity, so nothing here should attempt to reconstruct one.
 - No cross-tenant anything, consistent with every other endpoint in this
   API.
-
-## Response shape
-
-GET /v1/unattributed?since=...&until=...
-
-Returns a JSON object with these fields:
-  count           - integer, total unattributed span count in the window
-  service_names   - array of strings, distinct service.name values observed
-  models          - array of strings, distinct model values observed
-  earliest_seen   - ISO 8601 timestamp string or null
-  latest_seen     - ISO 8601 timestamp string or null
-
-Example with data: count 42, service_names ["unknown-checkout-svc",
-"legacy-batch-job"], models ["gpt-4o-mini", "claude-3-haiku"],
-earliest_seen "2026-07-01T00:00:00Z", latest_seen "2026-07-24T18:32:00Z".
-
-If count is 0, service_names and models return as empty arrays, earliest_seen
-and latest_seen return null. Do not omit the fields — the dashboard's honesty
-principle (present, do not fabricate or omit) applies to this endpoint's
-zero-case as much as to the dashboard itself.
-
-## Open question for review
-
-Endpoint vs. field: a new GET /v1/unattributed is proposed over adding a
-field to GET /v1/agents, since unattributed spans are explicitly NOT
-agent-scoped — bolting them onto the agent rollup response would misrepresent
-what the field means. Confirm this reasoning holds, or state a preferred
-alternative.
+- This is additive to the existing /v1/agents response — the agents array
+  and its per-agent shape are unchanged. Existing consumers of the agents
+  array must not break.
 
 ## Tests
 
 Following existing fixture/exact-assertion discipline (AgentRollupTests.cs
 pattern):
 - Fixture with a mix of attributed and unattributed spans (varied
-  service.name and model values, spread across timestamps). Assert count,
-  service_names, models, earliest_seen, latest_seen are all exactly correct.
+  service.name and gen_ai.request.model values, spread across timestamps).
+  Assert the unattributed object's count, service_names, models,
+  earliest_seen, latest_seen are all exactly correct, and the agents array
+  is unaffected.
 - Fixture with zero unattributed spans. Assert count=0, empty arrays, null
   timestamps — not omitted fields, not exceptions.
-- Fixture where attributed spans exist alongside unattributed ones. Assert
-  attributed spans are correctly excluded from every returned figure.
+- Fixture confirming attributed spans are correctly excluded from every
+  unattributed figure.
 - Since/until window handling test, consistent with #20's FakeTimeProvider
   pattern for the default trailing-30-day window.
+- A test specifically exercising whichever of (a)/(b)/(c) above turns out to
+  be true, so the resolved behavior has a regression test pinning it.
 
 ## Out of scope
 
 - Any drill-down into individual unattributed spans.
 - Any attempt to infer or reconstruct a likely agent identity for these
   spans — they are unattributed by definition.
-- Alerting, thresholds, or flagging logic — this endpoint reports numbers;
-  interpretation belongs to the dashboard/operator, same principle as
-  /v1/agents.
+- Alerting, thresholds, or flagging logic — this response reports numbers;
+  interpretation belongs to the dashboard/operator, same principle as the
+  rest of /v1/agents.
 
 ## Workflow
 
