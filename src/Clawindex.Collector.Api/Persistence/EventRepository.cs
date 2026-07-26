@@ -496,6 +496,96 @@ public sealed class EventRepository(IConfiguration configuration)
         return rollups;
     }
 
+    public async Task<UnattributedSummary> GetUnattributedSummaryAsync(
+        DateTimeOffset since,
+        DateTimeOffset until,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        var sinceStr = since.ToUniversalTime().ToString("O");
+        var untilStr = until.ToUniversalTime().ToString("O");
+
+        // Q1: aggregate count and time bounds
+        long count;
+        DateTimeOffset? earliestSeen;
+        DateTimeOffset? latestSeen;
+
+        await using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText =
+                """
+                SELECT COUNT(*), MIN(started_at), MAX(ended_at)
+                FROM span_state
+                WHERE agent_id IS NULL
+                  AND ended_at >= $since
+                  AND ended_at < $until;
+                """;
+            cmd.Parameters.AddWithValue("$since", sinceStr);
+            cmd.Parameters.AddWithValue("$until", untilStr);
+
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            await reader.ReadAsync(cancellationToken);
+            count       = reader.GetInt64(0);
+            earliestSeen = reader.IsDBNull(1) ? null : DateTimeOffset.Parse(reader.GetString(1));
+            latestSeen   = reader.IsDBNull(2) ? null : DateTimeOffset.Parse(reader.GetString(2));
+        }
+
+        if (count == 0)
+            return new UnattributedSummary(0, [], [], null, null);
+
+        // Q2: distinct models (dedicated column — no JSON parsing)
+        var models = new List<string>();
+        await using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText =
+                """
+                SELECT DISTINCT model
+                FROM span_state
+                WHERE agent_id IS NULL
+                  AND ended_at >= $since
+                  AND ended_at < $until
+                  AND model IS NOT NULL;
+                """;
+            cmd.Parameters.AddWithValue("$since", sinceStr);
+            cmd.Parameters.AddWithValue("$until", untilStr);
+
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                models.Add(reader.GetString(0));
+        }
+
+        // Q3: distinct service.name values from the merged attributes_json blob.
+        // SpanFlattener merges resource attributes (including service.name) into the per-span
+        // dict before persistence, so service.name is always present in attributes_json when
+        // the emitting SDK sets it. The quoted-key path '$."service.name"' handles the dot.
+        var serviceNames = new List<string>();
+        await using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText =
+                """
+                SELECT DISTINCT json_extract(attributes_json, '$."service.name"') AS service_name
+                FROM span_state
+                WHERE agent_id IS NULL
+                  AND ended_at >= $since
+                  AND ended_at < $until
+                  AND json_extract(attributes_json, '$."service.name"') IS NOT NULL;
+                """;
+            cmd.Parameters.AddWithValue("$since", sinceStr);
+            cmd.Parameters.AddWithValue("$until", untilStr);
+
+            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                serviceNames.Add(reader.GetString(0));
+        }
+
+        serviceNames.Sort(StringComparer.Ordinal);
+        models.Sort(StringComparer.Ordinal);
+
+        return new UnattributedSummary(count, [.. serviceNames], [.. models], earliestSeen, latestSeen);
+    }
+
     // Multi-tenancy addition: prepend WHERE tenant_id = $tenant_id before agent_id = $agent_id
     // — no other change to the SELECT or aggregation is needed.
     public async Task<AgentDetailRollup> GetAgentRollupAsync(

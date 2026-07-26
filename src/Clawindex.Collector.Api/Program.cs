@@ -144,7 +144,9 @@ app.MapGet("/v1/agents", async (
         ? enriched.OrderByDescending(r => r.EstimatedCostUsd ?? decimal.MinValue)
         : enriched;
 
-    return Results.Ok(ordered);
+    var unattributed = await repository.GetUnattributedSummaryAsync(sinceValue, untilValue, cancellationToken);
+
+    return Results.Ok(new AgentsResponse(ordered, unattributed));
 });
 
 app.MapGet("/v1/agents/{id}", async (

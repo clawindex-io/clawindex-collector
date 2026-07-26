@@ -591,7 +591,7 @@ public sealed class EconomicsIntegrationTests
         using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        var agentEl = body.RootElement.EnumerateArray().Single(e => e.GetProperty("agent_id").GetString() == agent.ToString());
+        var agentEl = body.RootElement.GetProperty("agents").EnumerateArray().Single(e => e.GetProperty("agent_id").GetString() == agent.ToString());
 
         Assert.Equal(10.50m, agentEl.GetProperty("estimated_cost_usd").GetDecimal());
         Assert.Equal(1.0,    agentEl.GetProperty("cost_coverage").GetDouble(), precision: 5);
@@ -616,7 +616,7 @@ public sealed class EconomicsIntegrationTests
             "/v1/agents?since=2026-04-01T00:00:00Z&until=2026-05-01T00:00:00Z");
         using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
-        var agentEl = body.RootElement.EnumerateArray().Single(e => e.GetProperty("agent_id").GetString() == agent.ToString());
+        var agentEl = body.RootElement.GetProperty("agents").EnumerateArray().Single(e => e.GetProperty("agent_id").GetString() == agent.ToString());
 
         Assert.Equal(JsonValueKind.Null, agentEl.GetProperty("estimated_cost_usd").ValueKind);
         Assert.Equal(0.0,  agentEl.GetProperty("cost_coverage").GetDouble());
@@ -640,7 +640,7 @@ public sealed class EconomicsIntegrationTests
             "/v1/agents?since=2026-05-01T00:00:00Z&until=2026-06-01T00:00:00Z");
         using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
-        var agentEl = body.RootElement.EnumerateArray().Single(e => e.GetProperty("agent_id").GetString() == agent.ToString());
+        var agentEl = body.RootElement.GetProperty("agents").EnumerateArray().Single(e => e.GetProperty("agent_id").GetString() == agent.ToString());
 
         // Unknown model → uncosted, even though tokens were present
         Assert.Equal(JsonValueKind.Null, agentEl.GetProperty("estimated_cost_usd").ValueKind);
@@ -665,7 +665,7 @@ public sealed class EconomicsIntegrationTests
             "/v1/agents?since=2026-06-01T00:00:00Z&until=2026-07-01T00:00:00Z");
         using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
-        var agentEl = body.RootElement.EnumerateArray().Single(e => e.GetProperty("agent_id").GetString() == agent.ToString());
+        var agentEl = body.RootElement.GetProperty("agents").EnumerateArray().Single(e => e.GetProperty("agent_id").GetString() == agent.ToString());
 
         Assert.Equal(0.5,  agentEl.GetProperty("cost_coverage").GetDouble(), precision: 5);
         Assert.Equal(1,    agentEl.GetProperty("costed_span_count").GetInt64());
@@ -692,7 +692,7 @@ public sealed class EconomicsIntegrationTests
             "/v1/agents?since=2026-06-01T00:00:00Z&until=2026-08-01T00:00:00Z&sort=estimated_cost_desc");
         using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
-        var agents = body.RootElement.EnumerateArray().ToList();
+        var agents = body.RootElement.GetProperty("agents").EnumerateArray().ToList();
         var firstCost  = agents.First().GetProperty("estimated_cost_usd").GetDecimal();
         var secondCost = agents.Skip(1).First().GetProperty("estimated_cost_usd").GetDecimal();
         Assert.True(firstCost >= secondCost);
@@ -718,7 +718,7 @@ public sealed class EconomicsIntegrationTests
             "/v1/agents?since=2026-07-01T00:00:00Z&until=2026-08-01T00:00:00Z&sort=estimated_cost_desc");
         using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
-        var agents  = body.RootElement.EnumerateArray().ToList();
+        var agents  = body.RootElement.GetProperty("agents").EnumerateArray().ToList();
         var firstId = agents.First().GetProperty("agent_id").GetString();
         Assert.Equal(costedAgent.ToString(), firstId);
     }
@@ -856,7 +856,7 @@ public sealed class EconomicsIntegrationTests
             "/v1/agents?since=2026-06-01T00:00:00Z&until=2026-08-01T00:00:00Z");
         using var agentsBody = await JsonDocument.ParseAsync(await agentsResponse.Content.ReadAsStreamAsync());
 
-        var agentEl = agentsBody.RootElement.EnumerateArray().Single(e => e.GetProperty("agent_id").GetString() == agent.ToString());
+        var agentEl = agentsBody.RootElement.GetProperty("agents").EnumerateArray().Single(e => e.GetProperty("agent_id").GetString() == agent.ToString());
         Assert.Equal(JsonValueKind.Null, agentEl.GetProperty("estimated_cost_usd").ValueKind);
 
         using var detailResponse = await fixture.CreateClient().GetAsync(

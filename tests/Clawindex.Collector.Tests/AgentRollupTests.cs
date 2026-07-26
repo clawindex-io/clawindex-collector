@@ -21,7 +21,8 @@ public sealed class AgentRollupTests
         string? provider = null,
         string? model = null,
         long? inputTokens = null,
-        long? outputTokens = null)
+        long? outputTokens = null,
+        string attributesJson = "{}")
     {
         var ended = endedAt ?? DateTimeOffset.UtcNow;
         return new SpanState(
@@ -40,7 +41,7 @@ public sealed class AgentRollupTests
             InputTokens: inputTokens,
             OutputTokens: outputTokens,
             IsConformant: isConformant,
-            AttributesJson: "{}",
+            AttributesJson: attributesJson,
             UpdatedAt: DateTimeOffset.UtcNow);
     }
 
@@ -245,7 +246,7 @@ public sealed class AgentRollupTests
             using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var rows = body.RootElement.EnumerateArray().ToList();
+            var rows = body.RootElement.GetProperty("agents").EnumerateArray().ToList();
             Assert.Single(rows);
             Assert.Equal(1, rows[0].GetProperty("span_count").GetInt64());
         }
@@ -323,8 +324,8 @@ public sealed class AgentRollupTests
         using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.Equal(JsonValueKind.Array, body.RootElement.ValueKind);
-        Assert.Equal(0, body.RootElement.GetArrayLength());
+        Assert.Equal(JsonValueKind.Array, body.RootElement.GetProperty("agents").ValueKind);
+        Assert.Equal(0, body.RootElement.GetProperty("agents").GetArrayLength());
     }
 
     // TC-10: total_input_tokens and total_output_tokens are summed correctly across
@@ -357,7 +358,7 @@ public sealed class AgentRollupTests
         using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        var row = Assert.Single(body.RootElement.EnumerateArray());
+        var row = Assert.Single(body.RootElement.GetProperty("agents").EnumerateArray());
         Assert.Equal(13_000L, row.GetProperty("total_input_tokens").GetInt64());
         Assert.Equal(5_500L,  row.GetProperty("total_output_tokens").GetInt64());
     }
@@ -388,8 +389,179 @@ public sealed class AgentRollupTests
         using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        var row = Assert.Single(body.RootElement.EnumerateArray());
+        var row = Assert.Single(body.RootElement.GetProperty("agents").EnumerateArray());
         Assert.Equal(0L, row.GetProperty("total_input_tokens").GetInt64());
         Assert.Equal(0L, row.GetProperty("total_output_tokens").GetInt64());
+    }
+
+    // TC-U1: Mix of attributed and unattributed spans — all five unattributed fields asserted
+    // exactly; agents array confirms no cross-contamination.
+    [Fact]
+    public async Task GetAgents_Unattributed_ReturnsCorrectCountServiceNamesModelsAndTimestamps()
+    {
+        using var fixture = new CollectorFixture();
+        var client = fixture.CreateClient();
+        var agentId = Guid.NewGuid().ToString();
+        var t1 = new DateTimeOffset(2025, 10, 5,  10, 0, 0, TimeSpan.Zero);
+        var t2 = new DateTimeOffset(2025, 10, 10, 12, 0, 0, TimeSpan.Zero);
+        var t3 = new DateTimeOffset(2025, 10, 20, 18, 0, 0, TimeSpan.Zero);
+        const string window = "?since=2025-10-01T00:00:00Z&until=2025-11-01T00:00:00Z";
+
+        // 2 attributed spans — must not affect unattributed figures
+        await fixture.Repository.UpsertSpanStateAsync(
+            MakeSpanState("attr1", "t-attr", agentId, endedAt: t2));
+        await fixture.Repository.UpsertSpanStateAsync(
+            MakeSpanState("attr2", "t-attr", agentId, endedAt: t2));
+
+        // 3 unattributed spans: 2 distinct service.name values, 2 distinct models, t1..t3
+        await fixture.Repository.UpsertSpanStateAsync(MakeSpanState(
+            "u1", "t-u1", agentId: null, model: "gpt-4o-mini",
+            startedAt: t1, endedAt: t2,
+            attributesJson: """{"service.name":"checkout-svc"}"""));
+        await fixture.Repository.UpsertSpanStateAsync(MakeSpanState(
+            "u2", "t-u2", agentId: null, model: "gpt-4o-mini",
+            startedAt: t2, endedAt: t3,
+            attributesJson: """{"service.name":"checkout-svc"}"""));
+        await fixture.Repository.UpsertSpanStateAsync(MakeSpanState(
+            "u3", "t-u3", agentId: null, model: "claude-haiku",
+            startedAt: t2, endedAt: t3,
+            attributesJson: """{"service.name":"batch-job"}"""));
+
+        using var response = await client.GetAsync($"/v1/agents{window}");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // agents array: exactly the attributed agent, uncontaminated
+        var agents = body.RootElement.GetProperty("agents").EnumerateArray().ToList();
+        Assert.Single(agents);
+        Assert.Equal(agentId, agents[0].GetProperty("agent_id").GetString());
+
+        var unattr = body.RootElement.GetProperty("unattributed");
+        Assert.Equal(3, unattr.GetProperty("count").GetInt64());
+
+        // service_names and models sorted alphabetically (ordinal)
+        var svcNames = unattr.GetProperty("service_names").EnumerateArray()
+            .Select(e => e.GetString()).ToList();
+        Assert.Equal(new[] { "batch-job", "checkout-svc" }, svcNames);
+
+        var models = unattr.GetProperty("models").EnumerateArray()
+            .Select(e => e.GetString()).ToList();
+        Assert.Equal(new[] { "claude-haiku", "gpt-4o-mini" }, models);
+
+        // earliest_seen = MIN(started_at) = t1; latest_seen = MAX(ended_at) = t3
+        var earliest = DateTimeOffset.Parse(unattr.GetProperty("earliest_seen").GetString()!);
+        var latest   = DateTimeOffset.Parse(unattr.GetProperty("latest_seen").GetString()!);
+        Assert.Equal(t1, earliest);
+        Assert.Equal(t3, latest);
+    }
+
+    // TC-U2: Zero unattributed spans — all fields present with zero/null values, not omitted.
+    [Fact]
+    public async Task GetAgents_NoUnattributedSpans_UnattributedZeroCaseAllFieldsPresent()
+    {
+        using var fixture = new CollectorFixture();
+        var client = fixture.CreateClient();
+        var agentId = Guid.NewGuid().ToString();
+        var t = new DateTimeOffset(2025, 11, 15, 0, 0, 0, TimeSpan.Zero);
+        const string window = "?since=2025-11-01T00:00:00Z&until=2025-12-01T00:00:00Z";
+
+        await fixture.Repository.UpsertSpanStateAsync(
+            MakeSpanState("a1", "t1", agentId, endedAt: t));
+
+        using var response = await client.GetAsync($"/v1/agents{window}");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var unattr = body.RootElement.GetProperty("unattributed");
+        Assert.Equal(0,                    unattr.GetProperty("count").GetInt64());
+        Assert.Equal(0,                    unattr.GetProperty("service_names").GetArrayLength());
+        Assert.Equal(0,                    unattr.GetProperty("models").GetArrayLength());
+        Assert.Equal(JsonValueKind.Null,   unattr.GetProperty("earliest_seen").ValueKind);
+        Assert.Equal(JsonValueKind.Null,   unattr.GetProperty("latest_seen").ValueKind);
+    }
+
+    // TC-U3: Attributed spans are excluded from every unattributed figure.
+    [Fact]
+    public async Task GetAgents_Unattributed_AttributedSpansExcludedFromFigures()
+    {
+        using var fixture = new CollectorFixture();
+        var client = fixture.CreateClient();
+        var agentId = Guid.NewGuid().ToString();
+        var t = new DateTimeOffset(2025, 12, 15, 0, 0, 0, TimeSpan.Zero);
+        const string window = "?since=2025-12-01T00:00:00Z&until=2026-01-01T00:00:00Z";
+
+        // Attributed span: its service.name and model must NOT appear in unattributed figures
+        await fixture.Repository.UpsertSpanStateAsync(MakeSpanState(
+            "attr", "t-attr", agentId, model: "gpt-4", endedAt: t,
+            attributesJson: """{"service.name":"attributed-svc"}"""));
+
+        // Unattributed span: only its service.name and model should appear
+        await fixture.Repository.UpsertSpanStateAsync(MakeSpanState(
+            "u1", "t-u1", agentId: null, model: "claude-haiku", endedAt: t,
+            attributesJson: """{"service.name":"unattributed-svc"}"""));
+
+        using var response = await client.GetAsync($"/v1/agents{window}");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var unattr = body.RootElement.GetProperty("unattributed");
+        Assert.Equal(1, unattr.GetProperty("count").GetInt64());
+
+        var svcNames = unattr.GetProperty("service_names").EnumerateArray()
+            .Select(e => e.GetString()).ToList();
+        Assert.Equal(new[] { "unattributed-svc" }, svcNames);
+
+        var models = unattr.GetProperty("models").EnumerateArray()
+            .Select(e => e.GetString()).ToList();
+        Assert.Equal(new[] { "claude-haiku" }, models);
+    }
+
+    // TC-U4: Window handling — unattributed spans outside [since, until) are excluded.
+    [Fact]
+    public async Task GetAgents_Unattributed_WindowExcludesOutOfRangeSpans()
+    {
+        using var fixture = new CollectorFixture();
+        var client = fixture.CreateClient();
+        var since = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        const string window = "?since=2026-01-01T00:00:00Z&until=2026-02-01T00:00:00Z";
+
+        // Inside window
+        await fixture.Repository.UpsertSpanStateAsync(
+            MakeSpanState("u-in",  "t-in",  agentId: null, endedAt: since.AddDays(15)));
+        // Outside window — ended_at before since (exclusive)
+        await fixture.Repository.UpsertSpanStateAsync(
+            MakeSpanState("u-out", "t-out", agentId: null, endedAt: since.AddSeconds(-1)));
+
+        using var response = await client.GetAsync($"/v1/agents{window}");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(1, body.RootElement.GetProperty("unattributed").GetProperty("count").GetInt64());
+    }
+
+    // TC-U5: Regression — spans with invalid clawindex.agent.id are stored with agent_id = NULL
+    // (behavior (b) per the ingestion contract). They must appear in unattributed, not in agents.
+    [Fact]
+    public async Task GetAgents_Unattributed_NullAgentIdStorageContractPinned()
+    {
+        using var fixture = new CollectorFixture();
+        var client = fixture.CreateClient();
+        var t = new DateTimeOffset(2026, 2, 15, 0, 0, 0, TimeSpan.Zero);
+        const string window = "?since=2026-02-01T00:00:00Z&until=2026-03-01T00:00:00Z";
+
+        // null AgentId is exactly what DurableSpanSink produces when AgentIdValidator.TryNormalize
+        // returns null for an absent or denylist-matching clawindex.agent.id.
+        await fixture.Repository.UpsertSpanStateAsync(
+            MakeSpanState("invalid-agent-span", "t-inv", agentId: null, isConformant: false, endedAt: t));
+
+        using var response = await client.GetAsync($"/v1/agents{window}");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(0, body.RootElement.GetProperty("agents").EnumerateArray().Count());
+        Assert.Equal(1, body.RootElement.GetProperty("unattributed").GetProperty("count").GetInt64());
     }
 }
