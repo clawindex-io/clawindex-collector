@@ -17,7 +17,11 @@ public sealed class AgentRollupTests
         string status = "unset",
         bool isConformant = true,
         DateTimeOffset? endedAt = null,
-        DateTimeOffset? startedAt = null)
+        DateTimeOffset? startedAt = null,
+        string? provider = null,
+        string? model = null,
+        long? inputTokens = null,
+        long? outputTokens = null)
     {
         var ended = endedAt ?? DateTimeOffset.UtcNow;
         return new SpanState(
@@ -31,10 +35,10 @@ public sealed class AgentRollupTests
             StartedAt: startedAt ?? ended.AddSeconds(-1),
             EndedAt: ended,
             Operation: null,
-            Provider: null,
-            Model: null,
-            InputTokens: null,
-            OutputTokens: null,
+            Provider: provider,
+            Model: model,
+            InputTokens: inputTokens,
+            OutputTokens: outputTokens,
             IsConformant: isConformant,
             AttributesJson: "{}",
             UpdatedAt: DateTimeOffset.UtcNow);
@@ -321,5 +325,71 @@ public sealed class AgentRollupTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(JsonValueKind.Array, body.RootElement.ValueKind);
         Assert.Equal(0, body.RootElement.GetArrayLength());
+    }
+
+    // TC-10: total_input_tokens and total_output_tokens are summed correctly across
+    // multiple (agent, model) buckets. Three haiku spans (1 000 in / 500 out each)
+    // plus two opus spans (5 000 in / 2 000 out each) → 13 000 in, 5 500 out total.
+    [Fact]
+    public async Task GetAgents_TokenTotals_SummedCorrectlyAcrossModelBuckets()
+    {
+        using var fixture = new CollectorFixture();
+        var client = fixture.CreateClient();
+        var agent = Guid.NewGuid().ToString();
+        var t = new DateTimeOffset(2025, 8, 15, 0, 0, 0, TimeSpan.Zero);
+        const string window = "?since=2025-08-01T00:00:00Z&until=2025-09-01T00:00:00Z";
+
+        // 3 × haiku: 3 000 in, 1 500 out
+        for (var i = 0; i < 3; i++)
+            await fixture.Repository.UpsertSpanStateAsync(MakeSpanState(
+                $"h{i}", "t-haiku", agent,
+                provider: "anthropic", model: "claude-haiku",
+                inputTokens: 1_000, outputTokens: 500, endedAt: t));
+
+        // 2 × opus: 10 000 in, 4 000 out
+        for (var i = 0; i < 2; i++)
+            await fixture.Repository.UpsertSpanStateAsync(MakeSpanState(
+                $"o{i}", "t-opus", agent,
+                provider: "anthropic", model: "claude-opus",
+                inputTokens: 5_000, outputTokens: 2_000, endedAt: t));
+
+        using var response = await client.GetAsync($"/v1/agents{window}");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var row = Assert.Single(body.RootElement.EnumerateArray());
+        Assert.Equal(13_000L, row.GetProperty("total_input_tokens").GetInt64());
+        Assert.Equal(5_500L,  row.GetProperty("total_output_tokens").GetInt64());
+    }
+
+    // TC-11: An agent whose spans carry no token attributes (null input_tokens /
+    // output_tokens in span_state) must return total_input_tokens = 0 and
+    // total_output_tokens = 0 exactly — not null, not absent.
+    [Fact]
+    public async Task GetAgents_NoTokenData_TokenTotalsAreExactlyZero()
+    {
+        using var fixture = new CollectorFixture();
+        var client = fixture.CreateClient();
+        var agent = Guid.NewGuid().ToString();
+        var t = new DateTimeOffset(2025, 9, 15, 0, 0, 0, TimeSpan.Zero);
+        const string window = "?since=2025-09-01T00:00:00Z&until=2025-10-01T00:00:00Z";
+
+        // Provider and model are present (as in _attrs_no_tokens) but token counts are null.
+        await fixture.Repository.UpsertSpanStateAsync(MakeSpanState(
+            "n1", "t-notok", agent,
+            provider: "anthropic", model: "claude-sonnet",
+            inputTokens: null, outputTokens: null, endedAt: t));
+        await fixture.Repository.UpsertSpanStateAsync(MakeSpanState(
+            "n2", "t-notok", agent,
+            provider: "anthropic", model: "claude-sonnet",
+            inputTokens: null, outputTokens: null, endedAt: t));
+
+        using var response = await client.GetAsync($"/v1/agents{window}");
+        using var body = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync());
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var row = Assert.Single(body.RootElement.EnumerateArray());
+        Assert.Equal(0L, row.GetProperty("total_input_tokens").GetInt64());
+        Assert.Equal(0L, row.GetProperty("total_output_tokens").GetInt64());
     }
 }
